@@ -1052,12 +1052,73 @@ def load_settings(config_path: Path | None = None) -> Settings:
 
     Returns:
         Settings instance with file values merged over defaults.
-    """
-    if config_path is None:
-        from openharness.config.paths import get_config_file_path
 
+    Performance note:
+        ``load_settings`` re-reads the JSON config file, parses it, and
+        re-validates with Pydantic on every call. On a Kaggle-style machine
+        the median cost is ~0.5 ms, but it spikes to >100 ms when the file
+        contains many profiles. The function is called from many hot paths
+        (every bash/grep/glob call via ``create_shell_subprocess``, every
+        command registry lookup, every network guard check, etc.), so we
+        cache the result keyed by ``(config_path, mtime, size)`` and only
+        re-read when the file actually changes. ``save_settings`` clears the
+        cache so a write-then-read sequence always returns the fresh value.
+    """
+    from openharness.config.paths import get_config_file_path
+
+    if config_path is None:
         config_path = get_config_file_path()
 
+    cache_key = _settings_cache_key(config_path)
+    cached = _SETTINGS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    settings = _load_settings_uncached(config_path)
+    _SETTINGS_CACHE[cache_key] = settings
+    return settings
+
+
+def _settings_cache_key(config_path: Path) -> tuple[str, float, int, int]:
+    """Build a cache key that invalidates when the file changes on disk.
+
+    Also folds in a hash of all ``OPENHARNESS_*`` / ``ANTHROPIC_*`` /
+    ``OPENAI_*`` environment variables, because ``_apply_env_overrides``
+    re-reads them on every call and tests (and real users) mutate them
+    between calls. Without this, setting ``OPENHARNESS_WEB_PROXY`` after
+    a previous ``load_settings()`` would return the stale cached value.
+    """
+    try:
+        stat = config_path.stat()
+        path_part: tuple[str, float, int] = (str(config_path), stat.st_mtime, stat.st_size)
+    except OSError:
+        path_part = (str(config_path), -1.0, -1)
+    env_hash = _env_fingerprint()
+    return (*path_part, env_hash)
+
+
+# Prefixes of env vars that influence the resolved Settings. Kept tight so the
+# fingerprint is cheap to compute.
+_SETTINGS_ENV_PREFIXES = ("OPENHARNESS_", "ANTHROPIC_", "OPENAI_", "CLAUDE_")
+
+
+def _env_fingerprint() -> int:
+    """Return a stable hash of all settings-relevant env vars.
+
+    Uses ``frozenset`` of items so the hash is order-independent, and Python's
+    built-in ``hash`` on a frozenset of (str, str) tuples. We slice the value
+    to a small cap so a giant env var can't dominate the cost.
+    """
+    items: list[tuple[str, str]] = []
+    for key, value in os.environ.items():
+        if not key.startswith(_SETTINGS_ENV_PREFIXES):
+            continue
+        items.append((key, value[:256]))
+    return hash(frozenset(items))
+
+
+def _load_settings_uncached(config_path: Path) -> Settings:
+    """Original implementation of ``load_settings`` without caching."""
     if config_path.exists():
         raw = json.loads(config_path.read_text(encoding="utf-8"))
         settings = Settings.model_validate(raw)
@@ -1083,6 +1144,21 @@ def load_settings(config_path: Path | None = None) -> Settings:
     return _apply_env_overrides(settings.materialize_active_profile())
 
 
+# In-process cache of (config_path, mtime, size) -> Settings. A simple dict
+# is fine here because settings writes are rare (CLI /config, /provider) and
+# always go through ``save_settings`` which clears the cache.
+_SETTINGS_CACHE: dict[tuple[str, float, int], Settings] = {}
+
+
+def clear_settings_cache() -> None:
+    """Clear the in-process settings cache.
+
+    Used by ``save_settings`` and by tests that mutate the config file
+    directly on disk.
+    """
+    _SETTINGS_CACHE.clear()
+
+
 def save_settings(settings: Settings, config_path: Path | None = None) -> None:
     """Persist settings to the config file.
 
@@ -1102,3 +1178,6 @@ def save_settings(settings: Settings, config_path: Path | None = None) -> None:
             config_path,
             settings.model_dump_json(indent=2) + "\n",
         )
+    # Invalidate the in-process cache so the next load_settings() picks up
+    # the new mtime/size and re-reads the file.
+    _SETTINGS_CACHE.clear()

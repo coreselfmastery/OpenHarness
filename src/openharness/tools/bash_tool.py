@@ -204,15 +204,35 @@ def _looks_like_interactive_scaffold(lowered_command: str) -> bool:
 
 
 def _looks_like_prompt(output: str) -> bool:
+    """Heuristic: detect when a command's output looks like an interactive prompt.
+
+    Only fires on phrases that strongly indicate a real prompt — previous
+    versions matched ``?`` and ``which`` anywhere in the output, which
+    false-triggered on regex output, code snippets, and paths containing
+    ``which``. The current markers require a leading prompt-like phrase
+    (e.g. ``"would you like"``) or a standalone ``"? "`` at end-of-line.
+    """
     if not output:
         return False
     prompt_markers: Iterable[str] = (
         "would you like",
         "ok to proceed",
         "select an option",
-        "which",
         "press enter to continue",
-        "?",
+        "press any key",
+        "[y/n]",
+        "[yes/no]",
+        "(y/n)",
+        "do you want to",
+        "are you sure",
+        "confirm:",
     )
     lowered_output = output.lower()
-    return any(marker in lowered_output for marker in prompt_markers)
+    if any(marker in lowered_output for marker in prompt_markers):
+        return True
+    # A trailing "? " on its own line is a strong prompt signal; a "?"
+    # buried inside other text (regex, code, JSON) is not.
+    last_line = lowered_output.rstrip().rsplit("\n", 1)[-1].strip()
+    if last_line.endswith("?") and len(last_line) < 80:
+        return True
+    return False

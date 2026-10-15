@@ -92,6 +92,27 @@ def _looks_like_git_repo(path: Path) -> bool:
     return False
 
 
+# Cache the git-repo check per resolved path. Glob is called many times in
+# a single agent turn, and each uncached call walks up to 6 directories with
+# stat() calls. A simple module-level dict is safe because the result for a
+# given path never changes during a process lifetime.
+_GIT_REPO_CACHE: dict[Path, bool] = {}
+
+
+def _cached_looks_like_git_repo(path: Path) -> bool:
+    """Cached version of ``_looks_like_git_repo``.
+
+    Walks up to 6 parent directories with stat() calls per invocation, which
+    adds up when glob runs dozens of times per agent turn.
+    """
+    cached = _GIT_REPO_CACHE.get(path)
+    if cached is not None:
+        return cached
+    result = _looks_like_git_repo(path)
+    _GIT_REPO_CACHE[path] = result
+    return result
+
+
 _GLOB_RG_TIMEOUT_SECONDS = 30.0
 
 
@@ -108,7 +129,7 @@ async def _glob(root: Path, pattern: str, *, limit: int) -> list[str]:
     # `Path.glob("**/*")` will traverse hidden and ignored paths (like `.venv/`)
     # and can be very slow on real workspaces. Prefer `rg --files`.
     if rg and ("**" in pattern or "/" in pattern):
-        include_hidden = _looks_like_git_repo(root)
+        include_hidden = _cached_looks_like_git_repo(root)
         cmd = [rg, "--files"]
         if include_hidden:
             cmd.append("--hidden")

@@ -7,11 +7,31 @@ import os
 import shutil
 import subprocess
 from collections.abc import Mapping
+from functools import lru_cache
 from pathlib import Path
 
 from openharness.config import Settings, load_settings
 from openharness.platforms import PlatformName, get_platform
 from openharness.sandbox import wrap_command_for_sandbox
+
+
+# Cache ``shutil.which`` lookups. The PATH doesn't change inside a running
+# process (except for tests that monkeypatch ``shutil.which`` directly —
+# they should call ``_which_cache_clear`` to invalidate). On a Kaggle
+# notebook, each ``which`` call costs ~0.3 ms because it scans every PATH
+# directory; we call this on every bash/grep/glob invocation.
+@lru_cache(maxsize=64)
+def _which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def _which_cache_clear() -> None:
+    """Clear the ``shutil.which`` cache.
+
+    Used by tests that monkeypatch ``shutil.which`` so the new mock is
+    picked up on the next call.
+    """
+    _which.cache_clear()
 
 
 def resolve_shell_command(
@@ -23,15 +43,15 @@ def resolve_shell_command(
     """Return argv for the best available shell on the current platform."""
     resolved_platform = platform_name or get_platform()
     if resolved_platform == "windows":
-        bash = shutil.which("bash")
+        bash = _which("bash")
         if bash and _bash_is_usable(bash):
             return [bash, "-lc", command]
-        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        powershell = _which("pwsh") or _which("powershell")
         if powershell:
             return [powershell, "-NoLogo", "-NoProfile", "-Command", command]
-        return [shutil.which("cmd.exe") or "cmd.exe", "/d", "/s", "/c", command]
+        return [_which("cmd.exe") or "cmd.exe", "/d", "/s", "/c", command]
 
-    bash = shutil.which("bash")
+    bash = _which("bash")
     if bash:
         argv = [bash, "-lc", command]
         if prefer_pty:
@@ -39,7 +59,7 @@ def resolve_shell_command(
             if wrapped is not None:
                 return wrapped
         return argv
-    shell = shutil.which("sh") or os.environ.get("SHELL") or "/bin/sh"
+    shell = _which("sh") or os.environ.get("SHELL") or "/bin/sh"
     argv = [shell, "-lc", command]
     if prefer_pty:
         wrapped = _wrap_command_with_script(argv, platform_name=resolved_platform)
@@ -113,7 +133,7 @@ def _wrap_command_with_script(
     resolved_platform = platform_name or get_platform()
     if resolved_platform == "macos":
         return None
-    script = shutil.which("script")
+    script = _which("script")
     if script is None:
         return None
     if len(argv) >= 3 and argv[1] == "-lc":

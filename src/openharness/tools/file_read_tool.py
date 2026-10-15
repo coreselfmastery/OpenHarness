@@ -44,13 +44,23 @@ class FileReadTool(BaseTool):
             if not allowed:
                 return ToolResult(output=f"Sandbox: {reason}", is_error=True)
 
-        if not path.exists():
-            return ToolResult(output=f"File not found: {path}", is_error=True)
-        if path.is_dir():
+        # Single stat() call instead of two. The previous code called
+        # ``path.exists()`` (one stat) and then ``path.is_dir()`` (another
+        # stat). On Kaggle's network-backed filesystems each stat can take
+        # several ms, so avoiding the redundant syscall matters when the
+        # agent reads many files in a turn. ``is_file`` returns False for
+        # both non-existent paths and directories.
+        if not path.is_file():
+            if not path.exists():
+                return ToolResult(output=f"File not found: {path}", is_error=True)
             return ToolResult(output=f"Cannot read directory: {path}", is_error=True)
 
         raw = path.read_bytes()
-        if b"\x00" in raw:
+        # Quick binary detection: only scan the first 8 KB. If there's no
+        # null byte in the first 8 KB, the file is almost certainly text.
+        # Scanning the whole file for a null byte is O(n) and wasteful for
+        # large text files (10 MB+ logs, generated code, etc.).
+        if b"\x00" in raw[:8192]:
             return ToolResult(output=f"Binary file cannot be read as text: {path}", is_error=True)
 
         text = raw.decode("utf-8", errors="replace")

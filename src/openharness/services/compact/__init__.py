@@ -114,21 +114,50 @@ class CompactionResult:
 # ---------------------------------------------------------------------------
 
 def estimate_message_tokens(messages: list[ConversationMessage]) -> int:
-    """Estimate total tokens for a conversation, including the 4/3 padding."""
+    """Estimate total tokens for a conversation, including the 4/3 padding.
+
+    Performance: this is called on every agent turn (via
+    ``should_autocompact``) and walks the entire conversation. We cache the
+    per-message token count on the message object itself so that repeated
+    calls only re-cost newly appended messages.
+    """
     total = 0
     image_token_estimate = _vision_token_budget_per_image()
     for msg in messages:
-        for block in msg.content:
-            if isinstance(block, TextBlock):
-                total += estimate_tokens(block.text)
-            elif isinstance(block, ToolResultBlock):
-                total += estimate_tokens(block.content)
-            elif isinstance(block, ToolUseBlock):
-                total += estimate_tokens(block.name)
-                total += estimate_tokens(str(block.input))
-            elif isinstance(block, ImageBlock):
-                total += image_token_estimate
+        cached = getattr(msg, "_oh_token_cache", None)
+        if cached is not None:
+            # Cache hit — but only valid if the image token budget hasn't
+            # changed via env var. Compare the cached budget to the current.
+            cached_budget, cached_tokens = cached
+            if cached_budget == image_token_estimate:
+                total += cached_tokens
+                continue
+        msg_tokens = _estimate_single_message_tokens(msg, image_token_estimate)
+        # Stash on the instance. ``ConversationMessage`` is a Pydantic
+        # model; we use ``object.__setattr__`` to bypass validation since
+        # this is a transient cache, not a real field.
+        try:
+            object.__setattr__(msg, "_oh_token_cache", (image_token_estimate, msg_tokens))
+        except (AttributeError, TypeError):
+            pass  # frozen/immutable model — skip caching
+        total += msg_tokens
     return int(total * TOKEN_ESTIMATION_PADDING)
+
+
+def _estimate_single_message_tokens(msg: ConversationMessage, image_token_estimate: int) -> int:
+    """Estimate tokens for a single message (no caching, no padding)."""
+    total = 0
+    for block in msg.content:
+        if isinstance(block, TextBlock):
+            total += estimate_tokens(block.text)
+        elif isinstance(block, ToolResultBlock):
+            total += estimate_tokens(block.content)
+        elif isinstance(block, ToolUseBlock):
+            total += estimate_tokens(block.name)
+            total += estimate_tokens(str(block.input))
+        elif isinstance(block, ImageBlock):
+            total += image_token_estimate
+    return total
 
 
 def estimate_conversation_tokens(messages: list[ConversationMessage]) -> int:

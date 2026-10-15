@@ -225,6 +225,30 @@ class CodexApiClient:
         self._auth_token = auth_token
         self._base_url = base_url
         self._url = _resolve_codex_url(base_url)
+        # Persistent HTTP client for connection reuse. Creating a new
+        # ``httpx.AsyncClient`` per request wastes a TLS handshake (~100-300 ms
+        # on Kaggle) on every agent turn. We lazily create the client on the
+        # first request (so ``__init__`` stays cheap) and reuse it for all
+        # subsequent requests. The client is closed via ``close()``.
+        self._http_client: httpx.AsyncClient | None = None
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=60.0,
+                follow_redirects=True,
+                # Keep-alive is on by default; limits allow connection reuse
+                # across turns. Kaggle's network has ~200ms RTT to OpenAI, so
+                # saving the TLS handshake per turn matters for long agent runs.
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            )
+        return self._http_client
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
+        self._http_client = None
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         last_error: Exception | None = None
@@ -273,72 +297,75 @@ class CodexApiClient:
         completed_response: dict[str, Any] | None = None
 
         headers = _build_codex_headers(self._auth_token)
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            async with client.stream("POST", self._url, headers=headers, json=body) as response:
-                if response.status_code >= 400:
-                    payload = await response.aread()
-                    message = _format_error_message(response.status_code, payload.decode("utf-8", "replace"))
-                    raise httpx.HTTPStatusError(message, request=response.request, response=response)
+        client = await self._get_http_client()
+        # Use the persistent client for connection reuse. We don't use
+        # ``async with client`` because that would close the client after
+        # the request — we want it to persist across turns.
+        async with client.stream("POST", self._url, headers=headers, json=body) as response:
+            if response.status_code >= 400:
+                payload = await response.aread()
+                message = _format_error_message(response.status_code, payload.decode("utf-8", "replace"))
+                raise httpx.HTTPStatusError(message, request=response.request, response=response)
 
-                async for event in self._iter_sse_events(response):
-                    event_type = event.get("type")
-                    if event_type == "response.output_text.delta":
-                        delta = event.get("delta")
-                        if isinstance(delta, str) and delta:
-                            current_text_parts.append(delta)
-                            yield ApiTextDeltaEvent(text=delta)
-                    elif event_type == "response.output_item.done":
-                        item = event.get("item")
-                        if not isinstance(item, dict):
-                            continue
-                        item_type = item.get("type")
-                        if item_type == "message":
-                            text = ""
-                            raw_content = item.get("content")
-                            if isinstance(raw_content, list):
-                                parts = []
-                                for block in raw_content:
-                                    if isinstance(block, dict):
-                                        if block.get("type") == "output_text":
-                                            parts.append(str(block.get("text", "")))
-                                        elif block.get("type") == "refusal":
-                                            parts.append(str(block.get("refusal", "")))
-                                text = "".join(parts)
-                            if text:
-                                content.append(TextBlock(text=text))
-                        elif item_type == "function_call":
-                            arguments = item.get("arguments")
-                            parsed_arguments: dict[str, Any]
-                            if isinstance(arguments, str) and arguments:
-                                try:
-                                    loaded = json.loads(arguments)
-                                except json.JSONDecodeError:
-                                    loaded = {}
-                            else:
+            async for event in self._iter_sse_events(response):
+                event_type = event.get("type")
+                if event_type == "response.output_text.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        current_text_parts.append(delta)
+                        yield ApiTextDeltaEvent(text=delta)
+                elif event_type == "response.output_item.done":
+                    item = event.get("item")
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "message":
+                        text = ""
+                        raw_content = item.get("content")
+                        if isinstance(raw_content, list):
+                            parts = []
+                            for block in raw_content:
+                                if isinstance(block, dict):
+                                    if block.get("type") == "output_text":
+                                        parts.append(str(block.get("text", "")))
+                                    elif block.get("type") == "refusal":
+                                        parts.append(str(block.get("refusal", "")))
+                            text = "".join(parts)
+                        if text:
+                            content.append(TextBlock(text=text))
+                    elif item_type == "function_call":
+                        arguments = item.get("arguments")
+                        parsed_arguments: dict[str, Any]
+                        if isinstance(arguments, str) and arguments:
+                            try:
+                                loaded = json.loads(arguments)
+                            except json.JSONDecodeError:
                                 loaded = {}
-                            parsed_arguments = loaded if isinstance(loaded, dict) else {}
-                            call_id = item.get("call_id")
-                            name = item.get("name")
-                            if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
-                                content.append(ToolUseBlock(id=call_id, name=name, input=parsed_arguments))
-                    elif event_type == "response.completed":
-                        response_payload = event.get("response")
-                        if isinstance(response_payload, dict):
-                            completed_response = response_payload
-                    elif event_type == "response.failed":
-                        response_payload = event.get("response")
-                        if isinstance(response_payload, dict):
-                            raise RequestFailure(
-                                _format_codex_stream_error(
-                                    response_payload,
-                                    fallback="Codex response failed",
-                                )
-                            )
-                        raise RequestFailure("Codex response failed")
-                    elif event_type == "error":
+                        else:
+                            loaded = {}
+                        parsed_arguments = loaded if isinstance(loaded, dict) else {}
+                        call_id = item.get("call_id")
+                        name = item.get("name")
+                        if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                            content.append(ToolUseBlock(id=call_id, name=name, input=parsed_arguments))
+                elif event_type == "response.completed":
+                    response_payload = event.get("response")
+                    if isinstance(response_payload, dict):
+                        completed_response = response_payload
+                elif event_type == "response.failed":
+                    response_payload = event.get("response")
+                    if isinstance(response_payload, dict):
                         raise RequestFailure(
-                            _format_codex_stream_error(event, fallback="Codex error")
+                            _format_codex_stream_error(
+                                response_payload,
+                                fallback="Codex response failed",
+                            )
                         )
+                    raise RequestFailure("Codex response failed")
+                elif event_type == "error":
+                    raise RequestFailure(
+                        _format_codex_stream_error(event, fallback="Codex error")
+                    )
 
         if current_text_parts and not any(isinstance(block, TextBlock) for block in content):
             content.insert(0, TextBlock(text="".join(current_text_parts)))

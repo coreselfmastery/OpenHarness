@@ -23,28 +23,55 @@ def _read_positive_int_env(name: str, default: int, *, minimum: int = 1) -> int:
         return default
 
 
+# Cache the parsed env values. These helpers are called on every tool result
+# (multiple times per agent turn), and each call re-reads the environment
+# and re-parses the integer. The values change only when the operator
+# restarts the process with new env vars, so we read them once at module
+# import. Tests that mutate the env should call ``_reset_env_cache()``.
+_TOOL_OUTPUT_INLINE_CHARS: int | None = None
+_TOOL_OUTPUT_PREVIEW_CHARS: int | None = None
+_MICROCOMPACT_TOOL_RESULT_CHARS: int | None = None
+
+
+def _reset_env_cache() -> None:
+    """Clear the cached env-derived constants. Used by tests."""
+    global _TOOL_OUTPUT_INLINE_CHARS, _TOOL_OUTPUT_PREVIEW_CHARS, _MICROCOMPACT_TOOL_RESULT_CHARS
+    _TOOL_OUTPUT_INLINE_CHARS = None
+    _TOOL_OUTPUT_PREVIEW_CHARS = None
+    _MICROCOMPACT_TOOL_RESULT_CHARS = None
+
+
 def tool_output_inline_chars() -> int:
-    return _read_positive_int_env(
-        "OPENHARNESS_TOOL_OUTPUT_INLINE_CHARS",
-        DEFAULT_TOOL_OUTPUT_INLINE_CHARS,
-        minimum=256,
-    )
+    global _TOOL_OUTPUT_INLINE_CHARS
+    if _TOOL_OUTPUT_INLINE_CHARS is None:
+        _TOOL_OUTPUT_INLINE_CHARS = _read_positive_int_env(
+            "OPENHARNESS_TOOL_OUTPUT_INLINE_CHARS",
+            DEFAULT_TOOL_OUTPUT_INLINE_CHARS,
+            minimum=256,
+        )
+    return _TOOL_OUTPUT_INLINE_CHARS
 
 
 def tool_output_preview_chars() -> int:
-    return _read_positive_int_env(
-        "OPENHARNESS_TOOL_OUTPUT_PREVIEW_CHARS",
-        DEFAULT_TOOL_OUTPUT_PREVIEW_CHARS,
-        minimum=128,
-    )
+    global _TOOL_OUTPUT_PREVIEW_CHARS
+    if _TOOL_OUTPUT_PREVIEW_CHARS is None:
+        _TOOL_OUTPUT_PREVIEW_CHARS = _read_positive_int_env(
+            "OPENHARNESS_TOOL_OUTPUT_PREVIEW_CHARS",
+            DEFAULT_TOOL_OUTPUT_PREVIEW_CHARS,
+            minimum=128,
+        )
+    return _TOOL_OUTPUT_PREVIEW_CHARS
 
 
 def microcompact_tool_result_chars() -> int:
-    return _read_positive_int_env(
-        "OPENHARNESS_MICROCOMPACT_TOOL_RESULT_CHARS",
-        DEFAULT_MICROCOMPACT_TOOL_RESULT_CHARS,
-        minimum=256,
-    )
+    global _MICROCOMPACT_TOOL_RESULT_CHARS
+    if _MICROCOMPACT_TOOL_RESULT_CHARS is None:
+        _MICROCOMPACT_TOOL_RESULT_CHARS = _read_positive_int_env(
+            "OPENHARNESS_MICROCOMPACT_TOOL_RESULT_CHARS",
+            DEFAULT_MICROCOMPACT_TOOL_RESULT_CHARS,
+            minimum=256,
+        )
+    return _MICROCOMPACT_TOOL_RESULT_CHARS
 
 
 def is_microcompactable_tool_result(tool_name: str, content: str) -> bool:
