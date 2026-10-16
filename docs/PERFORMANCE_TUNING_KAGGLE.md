@@ -6,26 +6,115 @@ in-code optimizations (caching, connection reuse, etc.) are already
 applied to the repo — this guide covers what you, the operator, can
 still tune.
 
+## 0. Auto-detection (no config needed)
+
+On Kaggle, OpenHarness auto-detects the hardware and applies sensible
+defaults for `max_concurrent_agents` and `batch_size` if you haven't
+explicitly set them. On a T4×2 notebook (2 GPUs, 4 CPUs) this means:
+
+- `max_concurrent_agents` → 16 (4 × 2 GPUs × 2 half-CPU groups)
+- `batch_size` → 4 (one image-gen call produces 4 images)
+- `auto_save` → True (notebooks die without warning)
+
+You only need to set the env vars below if you want to override these
+defaults or enable opt-in features.
+
 ## 1. Environment variables (set these in your Kaggle notebook)
 
+### Top-10 optimization env vars
+
 ```bash
-# --- Speed: fewer retries, tighter timeouts ---
+# Item 1: Max concurrent agents (default 5; raise to 15-20 for parallel scenes)
+export OPENHARNESS_MAX_CONCURRENT_AGENTS=15
+
+# Item 2: Batch size (default 1; raise to 4-8 for batch image/scene gen)
+export OPENHARNESS_BATCH_SIZE=4
+
+# Item 3: Auto-context injection (default ON; set to 0 to disable)
+# When ON, every spawned agent gets STYLE.md / STORYBOARD.md / BRIEF.md
+# prepended to its prompt automatically.
+export OPENHARNESS_AUTO_CONTEXT_INJECT=1
+
+# Item 5: Auto-compact at 60% of context window (default ~80%)
+# Lowering prevents "prompt too long" retries that cost a full extra
+# round-trip per failure.
+export OPENHARNESS_AUTO_COMPACT_THRESHOLD_RATIO=0.60
+
+# Item 6: Trusted-project mode (default OFF)
+# When ON, mutating tools (edit_file, write_file) are auto-approved for
+# paths inside the project cwd. Sensitive paths (.ssh/.aws/.kube) are
+# still blocked. Set to 0 for interactive confirmation prompts.
+export OPENHARNESS_TRUSTED_PROJECT=1
+
+# Item 7: Tool result cache (default OFF)
+# When ON, identical read_file / grep / glob calls return cached results
+# instead of re-executing. Cache is invalidated on any mutating tool.
+export OPENHARNESS_TOOL_CACHE=1
+
+# Item 7 cont: Tool cache TTL in seconds (default 3600 = 1 hour)
+# Set to 0 to disable time-based expiry (rely on mutation only).
+export OPENHARNESS_TOOL_CACHE_TTL_SECONDS=3600
+
+# Item 8: Parallel tool execution (default ON)
+# When ON, multiple tool calls from a single model turn run concurrently.
+# Set to 0 for deterministic sequential execution (debugging).
+export OPENHARNESS_PARALLEL_TOOLS=1
+
+# Item 9: Thinking budget (default unset)
+# Per-call reasoning token budget for thinking models. Maps to
+# Anthropic's `thinking.budget_tokens` for Claude 3.5+ and to
+# OpenAI's `reasoning_effort` (low/medium/high) for o1/o3/gpt-5.
+export OPENHARNESS_THINKING_BUDGET=4096
+
+# Item 10: Session auto-save (default ON)
+# When ON, a session snapshot is written to ~/.openharness/sessions/
+# every N turns. On crash / OOM / Kaggle restart, you can resume with
+# `oh --resume`.
+export OPENHARNESS_AUTO_SAVE=1
+
+# Item 10 cont: Auto-save interval (default 10)
+# Save every N turns. 1 = save every turn (safest, slowest).
+# 10 = save every 10 turns (good balance for long runs).
+export OPENHARNESS_AUTO_SAVE_INTERVAL=10
+```
+
+### Trusted paths whitelist (optional)
+
+```bash
+# Item 8: Extra paths auto-approved when trusted_project=1.
+# Colon-separated list. Project cwd is always trusted; this adds
+# sibling dirs like /data/assets or /tmp/output.
+export OPENHARNESS_TRUSTED_PATHS=/data/assets:/tmp/output:/var/cache
+```
+
+### Speed: fewer retries, tighter timeouts
+
+```bash
 export OPENHARNESS_MAX_TOKENS=8192          # Larger output window per turn
 export OPENHARNESS_TIMEOUT=120               # 2 min per API call (Kaggle network is slow)
 export OPENHARNESS_MAX_TURNS=50              # Cap agent turns before giving up
+```
 
-# --- Speed: auto-compact tuning ---
-# Compact earlier than the default to avoid PTL retries (which cost a full
-# extra round-trip). On Kaggle's slower network, each retry is ~3-5 s.
+### Speed: auto-compact absolute override
+
+```bash
+# Alternative to OPENHARNESS_AUTO_COMPACT_THRESHOLD_RATIO: explicit token count.
+# When set, takes precedence over the ratio.
 export OPENHARNESS_AUTO_COMPACT_THRESHOLD_TOKENS=120000
+```
 
-# --- Speed: tool output budgets ---
+### Speed: tool output budgets
+
+```bash
 # Larger inline budget = fewer file offloads = fewer disk reads on the
 # next turn. 32 KB is a good balance for T4 memory.
 export OPENHARNESS_TOOL_OUTPUT_INLINE_CHARS=32000
 export OPENHARNESS_TOOL_OUTPUT_PREVIEW_CHARS=4000
+```
 
-# --- Speed: disable features you don't need on Kaggle ---
+### Speed: disable features you don't need on Kaggle
+
+```bash
 # Memory extraction runs an extra LLM call after every turn — disable
 # unless you specifically need cross-session memory.
 export OPENHARNESS_MEMORY_ENABLED=1
@@ -33,7 +122,6 @@ export OPENHARNESS_MEMORY_AUTO_EXTRACT_ENABLED=0
 export OPENHARNESS_MEMORY_SESSION_MEMORY_ENABLED=0
 export OPENHARNESS_MEMORY_AUTO_DREAM_ENABLED=0
 
-# --- Speed: sandbox ---
 # Docker sandbox is not available on Kaggle — disable it so we don't
 # waste time probing for Docker on every bash call.
 export OPENHARNESS_SANDBOX_ENABLED=0
@@ -55,7 +143,37 @@ The OpenAI-compatible client has lower per-turn overhead than the
 Anthropic SDK path (smaller payload, no beta headers, no OAuth
 attribution stitching).
 
-## 3. Use `fast` mode for iterative work
+## 3. Multi-provider routing (Item 4)
+
+Configure in `~/.openharness/settings.json`:
+
+```json
+{
+  "provider_routing": {
+    "primary": {"name": "groq"},
+    "fallbacks": [
+      {
+        "name": "dashscope",
+        "api_format": "openai",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key": "sk-your-dashscope-key",
+        "delay_seconds": 0.0
+      },
+      {
+        "name": "together",
+        "api_format": "openai",
+        "base_url": "https://api.together.xyz/v1",
+        "api_key": "your-together-key"
+      }
+    ]
+  }
+}
+```
+
+When the primary rate-limits or 5xxs, the request is automatically
+replayed against each fallback in order.
+
+## 4. Use `fast` mode for iterative work
 
 ```bash
 oh config set fast_mode true
@@ -65,7 +183,20 @@ Or invoke `oh --fast "your prompt"` for a single fast session. Fast
 mode tells the model to prefer concise replies and minimal tool use,
 which is what you want during exploratory Kaggle iterations.
 
-## 4. Provider-specific tips
+## 5. CLI flags
+
+```bash
+# Cap agent turns (prevents runaway loops)
+oh --max-turns 50 "your prompt"
+
+# Set per-call reasoning budget for thinking models
+oh --thinking-budget 4096 "your prompt"
+
+# Both together
+oh --max-turns 50 --thinking-budget 4096 -p "your prompt"
+```
+
+## 6. Provider-specific tips
 
 ### DashScope (Alibaba Qwen)
 ```bash
@@ -83,7 +214,7 @@ export OPENAI_API_KEY=gsk_your-groq-key
 export OPENHARNESS_MODEL=llama-3.3-70b-versatile
 ```
 Groq has the lowest latency of any provider (~50 ms TTFT) but a small
-context window (128 K). Set `OPENHARNESS_AUTO_COMPACT_THRESHOLD_TOKENS=80000`.
+context window (128 K). Set `OPENHARNESS_AUTO_COMPACT_THRESHOLD_RATIO=0.60`.
 
 ### Together AI
 ```bash
@@ -92,32 +223,47 @@ export OPENAI_API_KEY=your-together-key
 export OPENHARNESS_MODEL=meta-llama/Llama-3.3-70B-Instruct-Turbo
 ```
 
-## 5. What was optimized in this commit (summary)
+## 7. Recommended Kaggle env-var block (copy-paste ready)
+
+```bash
+# === OpenHarness Kaggle optimizations ===
+export OPENHARNESS_MAX_CONCURRENT_AGENTS=15
+export OPENHARNESS_BATCH_SIZE=4
+export OPENHARNESS_AUTO_CONTEXT_INJECT=1
+export OPENHARNESS_AUTO_COMPACT_THRESHOLD_RATIO=0.60
+export OPENHARNESS_TRUSTED_PROJECT=1
+export OPENHARNESS_TRUSTED_PATHS=/kaggle/working:/kaggle/input
+export OPENHARNESS_TOOL_CACHE=1
+export OPENHARNESS_TOOL_CACHE_TTL_SECONDS=3600
+export OPENHARNESS_PARALLEL_TOOLS=1
+export OPENHARNESS_AUTO_SAVE=1
+export OPENHARNESS_AUTO_SAVE_INTERVAL=10
+export OPENHARNESS_THINKING_BUDGET=4096
+export OPENHARNESS_SANDBOX_ENABLED=0
+export OPENHARNESS_MAX_TOKENS=8192
+export OPENHARNESS_TIMEOUT=120
+export OPENHARNESS_MAX_TURNS=50
+```
+
+## 8. What was optimized in the code (summary)
 
 | Hot path | Before | After | Speedup |
-|---|---|---|---|
+|---|---:|---:|---:|
 | `tool_registry.to_api_schema()` (per-turn) | 9.7 ms | 0.0002 ms | **48,500×** |
-| `load_settings()` (per bash/grep call) | 0.5 ms median, 123 ms p99 | 0.04 ms stable | **12.5× median, 3000× p99** |
+| `load_settings()` (per bash/grep call) | 0.5 ms / 123 ms p99 | 0.04 ms stable | **12.5× / 2,000× p99** |
 | `estimate_message_tokens()` (per-turn) | 0.44 ms | 0.011 ms | **40×** |
-| `tool_output_inline_chars()` (per tool result) | env parse every call | cached | ~100× |
-| Codex API client HTTP | new connection per request | persistent + keep-alive | **saves 100-300 ms per turn** |
-| `file_read_tool` binary detection | scan whole file | scan first 8 KB | ~10× for large files |
-| `file_read_tool` stat calls | 2 stats (exists + is_dir) | 1 stat (is_file) | **2× fewer syscalls** |
-| `_looks_like_git_repo` (glob) | 6 stats per call | cached per path | ~6× |
-| `shutil.which` (shell resolver) | PATH walk per call | `lru_cache` | ~10× |
+| Codex HTTP per turn | new TLS handshake | keep-alive | **saves 100-300 ms/turn** |
+| Tool cache (cache hit) | full re-execution | dict lookup | **variable, up to 100×** |
+| Trusted project (edit_file) | user prompt | auto-approve | **saves 5-30 s/turn** |
 
-## 6. What you should NOT do on Kaggle
+## 9. What you should NOT do on Kaggle
 
-- **Don't enable Docker sandbox.** Kaggle doesn't allow Docker, and the
-  probing code adds latency to every bash call.
-- **Don't enable auto-dream.** It schedules background LLM calls that
-  compete with your foreground session for the Kaggle GPU/network.
-- **Don't use `cron` features.** Kaggle notebooks don't persist across
-  restarts, so scheduled jobs are lost anyway.
-- **Don't install `mcp` v2 servers.** OpenHarness is currently pinned to
-  `mcp<2`. Upgrade will come in a follow-up release.
+- **Don't enable Docker sandbox.** Kaggle doesn't allow Docker.
+- **Don't enable auto-dream.** It schedules background LLM calls.
+- **Don't use `cron` features.** Kaggle notebooks don't persist.
+- **Don't install `mcp` v2 servers.** OpenHarness is pinned to `mcp<2`.
 
-## 7. Verifying your setup
+## 10. Verifying your setup
 
 After applying the env vars above, run:
 
@@ -125,14 +271,10 @@ After applying the env vars above, run:
 oh doctor
 ```
 
-This checks that your config is valid and the API client can connect.
-If everything is green, you're ready to run.
-
 To benchmark a single turn:
 
 ```bash
 time oh --fast "list the files in the current directory"
 ```
 
-The first turn (cold) will take ~2-4 s (TLS handshake + model TTFT).
-Subsequent turns should be <1 s for simple queries.
+The first turn (cold) will take ~2-4 s. Subsequent turns should be <1 s.

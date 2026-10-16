@@ -220,6 +220,18 @@ class AnthropicApiClient:
             )
         if request.tools:
             params["tools"] = request.tools
+        # Optimization #9: forward thinking_budget to Anthropic.
+        # Claude 3.5+ supports extended thinking via a ``thinking`` field
+        # carrying ``{"type": "enabled", "budget_tokens": N}``. We map
+        # the integer ``thinking_budget`` to that field when it is set.
+        # Older models that don't support thinking will reject the field,
+        # so we only set it for claude-3-5-sonnet / claude-4-* / opus-4-*.
+        if request.thinking_budget is not None and request.thinking_budget > 0:
+            model_lower = (request.model or "").lower()
+            if _model_supports_anthropic_thinking(model_lower):
+                # Anthropic requires budget_tokens < max_tokens; clamp.
+                budget = min(request.thinking_budget, max(1024, request.max_tokens - 1024))
+                params["thinking"] = {"type": "enabled", "budget_tokens": budget}
         if self._claude_oauth:
             params["betas"] = claude_oauth_betas()
             params["metadata"] = {
@@ -262,6 +274,29 @@ class AnthropicApiClient:
             ),
             stop_reason=getattr(final_message, "stop_reason", None),
         )
+
+
+# Anthropic models that support extended thinking via the ``thinking`` field.
+# Listing is conservative — Claude 3.5 Sonnet v2 + Claude 4 series. Older
+# models reject the field with a 400, so we omit it for them.
+_ANTHROPIC_THINKING_MODEL_PREFIXES: tuple[str, ...] = (
+    "claude-3-5-sonnet",
+    "claude-3-5-haiku",
+    "claude-3-7-sonnet",
+    "claude-sonnet-4",
+    "claude-opus-4",
+    "claude-haiku-4",
+    "claude-3.5-sonnet",
+    "claude-3.7-sonnet",
+)
+
+
+def _model_supports_anthropic_thinking(model_lower: str) -> bool:
+    """Return True if the model accepts the ``thinking`` field."""
+    # Strip provider prefix like "anthropic/claude-..."
+    if "/" in model_lower:
+        model_lower = model_lower.rsplit("/", 1)[-1]
+    return any(model_lower.startswith(prefix) for prefix in _ANTHROPIC_THINKING_MODEL_PREFIXES)
 
 
 def _translate_api_error(exc: APIError) -> OpenHarnessApiError:

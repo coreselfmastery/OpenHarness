@@ -63,10 +63,19 @@ class PermissionChecker:
         *,
         trusted_project: bool = False,
         project_cwd: str | None = None,
+        trusted_paths: list[str] | None = None,
     ) -> None:
         self._settings = settings
         self._trusted_project = trusted_project
         self._project_cwd = project_cwd.rstrip("/") if project_cwd else None
+        # Optimization #6 + #8: extra whitelist of safe paths. When
+        # ``trusted_project`` is on, mutating tools whose target is
+        # inside any of these paths are auto-approved. Always-rstrip "/"
+        # so prefix-matching is clean ("a/b" matches "a/b/c" but not
+        # "a/bc/d").
+        self._trusted_paths: list[str] = [
+            p.rstrip("/") for p in (trusted_paths or []) if p and p.strip()
+        ]
         self._path_rules: list[PathRule] = []
         for rule in getattr(settings, "path_rules", []):
             pattern = getattr(rule, "pattern", None) or (rule.get("pattern") if isinstance(rule, dict) else None)
@@ -136,9 +145,10 @@ class PermissionChecker:
                 reason="Plan mode blocks mutating tools until the user exits plan mode",
             )
 
-        # Optimization #6: trusted-project mode auto-approves in-project mutations.
-        if self._trusted_project and self._project_cwd and file_path:
-            if _path_is_inside(file_path, self._project_cwd):
+        # Optimization #6 + #8: trusted-project mode auto-approves in-project
+        # mutations AND any path inside the explicit ``trusted_paths`` whitelist.
+        if self._trusted_project and file_path:
+            if self._project_cwd and _path_is_inside(file_path, self._project_cwd):
                 return PermissionDecision(
                     allowed=True,
                     reason=(
@@ -146,6 +156,15 @@ class PermissionChecker:
                         f"(target inside {self._project_cwd})"
                     ),
                 )
+            for safe_path in self._trusted_paths:
+                if _path_is_inside(file_path, safe_path):
+                    return PermissionDecision(
+                        allowed=True,
+                        reason=(
+                            f"Trusted-project mode auto-approved {tool_name} "
+                            f"(target matches trusted_paths entry {safe_path})"
+                        ),
+                    )
 
         bash_hint = _bash_permission_hint(command)
         reason = (
@@ -173,15 +192,18 @@ def _path_is_inside(path: str, root: str) -> bool:
 def build_permission_checker(settings, *, cwd: str | None = None) -> PermissionChecker:
     """Build a PermissionChecker wired to the full Settings.
 
-    Forwards ``settings.trusted_project`` and the project ``cwd`` so
-    trusted-project mode (optimization #6) can auto-approve in-project
-    mutations.
+    Forwards ``settings.trusted_project``, ``settings.trusted_paths``,
+    and the project ``cwd`` so trusted-project mode (optimization #6
+    and #8) can auto-approve in-project mutations and explicit
+    whitelist paths.
     """
     trusted = bool(getattr(settings, "trusted_project", False))
+    trusted_paths = list(getattr(settings, "trusted_paths", []) or [])
     return PermissionChecker(
         settings.permission,
         trusted_project=trusted,
         project_cwd=str(cwd) if cwd else None,
+        trusted_paths=trusted_paths,
     )
 
 

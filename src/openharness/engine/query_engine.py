@@ -65,6 +65,11 @@ class QueryEngine:
         self._settings = settings
         self._messages: list[ConversationMessage] = []
         self._cost_tracker = CostTracker()
+        # Optimization #7 + #10: count user turns so we only auto-save
+        # every ``auto_save_interval`` turns (default 10). Saving on
+        # every turn is too aggressive for long video-generation runs.
+        self._turn_count = 0
+        self._last_save_turn = 0
 
     @property
     def messages(self) -> list[ConversationMessage]:
@@ -285,17 +290,23 @@ class QueryEngine:
             await self._update_session_memory()
             await self._extract_durable_memories()
             self._schedule_auto_dream()
+            self._turn_count += 1
             self._auto_save_session()
 
     def _auto_save_session(self) -> None:
         """Save a session snapshot when ``settings.auto_save`` is True.
 
-        Implements optimization #10. Writes ``latest.json`` to
-        ``~/.openharness/sessions/<project>-<hash>/`` after every user
-        turn. Failures are logged and swallowed so auto-save never
-        crashes the agent loop.
+        Implements optimization #10 + #7: saves a ``latest.json`` snapshot
+        every ``auto_save_interval`` turns (default 10). Saving on every
+        turn is too aggressive for long video-generation runs — disk
+        writes on Kaggle are slow and the snapshot can be 1-10 MB.
+        Failures are logged and swallowed so auto-save never crashes
+        the agent loop.
         """
         if self._settings is None or not getattr(self._settings, "auto_save", True):
+            return
+        interval = max(1, int(getattr(self._settings, "auto_save_interval", 10) or 10))
+        if self._turn_count - self._last_save_turn < interval:
             return
         try:
             from openharness.services.session_storage import save_session_snapshot
@@ -308,6 +319,7 @@ class QueryEngine:
                 session_id=str(self._tool_metadata.get("session_id") or ""),
                 tool_metadata=self._tool_metadata,
             )
+            self._last_save_turn = self._turn_count
         except Exception:
             import logging
             logging.getLogger(__name__).debug(

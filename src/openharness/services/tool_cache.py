@@ -101,13 +101,16 @@ class ToolResultCache:
 
         ``None`` means "not in cache OR expired". Callers must be prepared
         to execute the tool and call :meth:`put` with the result.
+
+        When ``ttl_seconds`` is 0 (or negative), entries never expire —
+        they only evict via LRU or mutation.
         """
         key = self.make_key(tool_name, tool_input)
         entry = self._entries.get(key)
         if entry is None:
             self._misses += 1
             return None
-        if (time.monotonic() - entry.created_at) > self._ttl_seconds:
+        if self._ttl_seconds > 0 and (time.monotonic() - entry.created_at) > self._ttl_seconds:
             # Expired — evict and miss.
             self._entries.pop(key, None)
             self._misses += 1
@@ -206,11 +209,14 @@ def configure_tool_cache_from_settings(settings: Any) -> None:
 
     Called once at engine startup. If ``settings.tool_cache_enabled`` is
     False (the default), the cache is disabled and ``get_tool_cache()``
-    returns ``None``.
+    returns ``None``. When enabled, the TTL is read from
+    ``settings.tool_cache_ttl_seconds`` (default 3600s) so stale
+    filesystem reads eventually expire even without a mutating call.
     """
     if getattr(settings, "tool_cache_enabled", False):
         max_entries = int(getattr(settings, "tool_cache_max_entries", 256) or 256)
-        enable_tool_cache(max_entries=max_entries)
+        ttl_seconds = float(getattr(settings, "tool_cache_ttl_seconds", 3600) or 3600)
+        enable_tool_cache(max_entries=max_entries, ttl_seconds=ttl_seconds)
     else:
         disable_tool_cache()
 

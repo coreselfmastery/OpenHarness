@@ -531,7 +531,7 @@ def test_optimization_10_auto_save_writes_snapshot(tmp_path: Path, monkeypatch):
     from openharness.config.settings import clear_settings_cache
     clear_settings_cache()
 
-    settings = Settings(auto_save=True)
+    settings = Settings(auto_save=True, auto_save_interval=1)
     fake_client = MagicMock()
     fake_client.close = AsyncMock()
     engine = QueryEngine(
@@ -547,6 +547,9 @@ def test_optimization_10_auto_save_writes_snapshot(tmp_path: Path, monkeypatch):
     engine.load_messages([
         ConversationMessage(role="user", content=[TextBlock(text="hello")]),
     ])
+    # Simulate one completed turn so the interval check (default 10)
+    # doesn't skip the save. With auto_save_interval=1, every turn saves.
+    engine._turn_count = 1
     engine._auto_save_session()
     # Snapshot should be written to the project session dir
     session_dir = get_sessions_dir()

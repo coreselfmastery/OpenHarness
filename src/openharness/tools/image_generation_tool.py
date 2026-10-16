@@ -90,6 +90,15 @@ class ImageGenerationTool(BaseTool):
             config = {}
         provider = _resolve_provider(arguments.provider, config)
 
+        # Optimization #2: when batch_size is configured (settings.batch_size
+        # or OPENHARNESS_BATCH_SIZE), and the caller didn't explicitly set
+        # ``n``, raise ``n`` to ``batch_size`` so one API call produces
+        # multiple images. This is the main lever for throughput on
+        # batch-scene / batch-shot workflows.
+        batch_size = int(context.metadata.get("batch_size", 1) or 1) if context.metadata else 1
+        if batch_size > 1 and arguments.n == 1:
+            arguments = arguments.model_copy(update={"n": min(batch_size, 10)})
+
         try:
             output_paths = self._resolve_output_paths(arguments, context.cwd)
             if provider == "codex":

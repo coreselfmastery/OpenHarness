@@ -610,10 +610,23 @@ class Settings(BaseModel):
     batch_size: int = 1
     auto_compact_threshold_ratio: float | None = None
     trusted_project: bool = False
+    # Optimization #6 + #8: extra paths auto-approved when trusted_project
+    # is on. Use this to whitelist sibling project dirs, asset roots, etc.
+    # Paths are matched as path-prefix (after rstrip "/"), so
+    # "/data/assets" matches "/data/assets/foo.png" but not "/data/assets-extra".
+    trusted_paths: list[str] = Field(default_factory=list)
     tool_cache_enabled: bool = False
     tool_cache_max_entries: int = 256
+    # Optimization #7: TTL for tool-cache entries, in seconds. Default
+    # 3600 (1 hour) so stale filesystem reads eventually expire. Set to
+    # 0 to disable expiry (rely on mutation-based invalidation only).
+    tool_cache_ttl_seconds: int = 3600
     parallel_tools: bool = True
     auto_save: bool = True
+    # Optimization #7 + #10: save a session snapshot every N turns (default 10).
+    # 1 = save after every turn (most resilient, slowest). 0 = same as 1
+    # for backwards compat. Larger values reduce disk writes on long runs.
+    auto_save_interval: int = 10
     thinking_budget: int | None = None
     auto_context_inject: bool = True
     auto_context_files: list[str] = Field(
@@ -1079,6 +1092,26 @@ def _apply_env_overrides(settings: Settings) -> Settings:
     tool_cache_env = os.environ.get("OPENHARNESS_TOOL_CACHE")
     if tool_cache_env is not None:
         updates["tool_cache_enabled"] = _parse_bool_env(tool_cache_env)
+
+    tool_cache_ttl_env = os.environ.get("OPENHARNESS_TOOL_CACHE_TTL_SECONDS")
+    if tool_cache_ttl_env:
+        try:
+            updates["tool_cache_ttl_seconds"] = max(0, int(tool_cache_ttl_env))
+        except ValueError:
+            pass
+
+    trusted_paths_env = os.environ.get("OPENHARNESS_TRUSTED_PATHS")
+    if trusted_paths_env:
+        updates["trusted_paths"] = [
+            p.strip().rstrip("/") for p in trusted_paths_env.split(":") if p.strip()
+        ]
+
+    auto_save_interval_env = os.environ.get("OPENHARNESS_AUTO_SAVE_INTERVAL")
+    if auto_save_interval_env:
+        try:
+            updates["auto_save_interval"] = max(0, int(auto_save_interval_env))
+        except ValueError:
+            pass
 
     parallel_tools_env = os.environ.get("OPENHARNESS_PARALLEL_TOOLS")
     if parallel_tools_env is not None:

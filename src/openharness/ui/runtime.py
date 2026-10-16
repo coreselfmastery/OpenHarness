@@ -191,7 +191,12 @@ class RuntimeBundle:
 
 
 def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
-    """Build the appropriate API client for the resolved settings."""
+    """Build the appropriate API client for the resolved settings.
+
+    If ``settings.provider_routing`` is configured (optimization #4),
+    the returned client is a :class:`RoutedStreamingClient` that tries
+    the primary provider first and falls back on retryable errors.
+    """
     # Ensure profile fields (base_url, model, api_format) are projected to settings
     settings = settings.materialize_active_profile()
 
@@ -202,40 +207,105 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             _print_auth_resolution_error(settings, exc)
             raise SystemExit(1)
 
-    if settings.api_format == "copilot":
-        from openharness.api.copilot_client import COPILOT_DEFAULT_MODEL
+    def _build_primary() -> SupportsStreamingMessages:
+        if settings.api_format == "copilot":
+            from openharness.api.copilot_client import COPILOT_DEFAULT_MODEL
 
-        copilot_model = (
-            COPILOT_DEFAULT_MODEL
-            if settings.model in {"claude-sonnet-4-20250514", "claude-sonnet-4-6", "sonnet", "default"}
-            else settings.model
-        )
-        return CopilotClient(model=copilot_model)
-    if settings.provider == "openai_codex":
+            copilot_model = (
+                COPILOT_DEFAULT_MODEL
+                if settings.model in {"claude-sonnet-4-20250514", "claude-sonnet-4-6", "sonnet", "default"}
+                else settings.model
+            )
+            return CopilotClient(model=copilot_model)
+        if settings.provider == "openai_codex":
+            auth = _safe_resolve_auth()
+            return CodexApiClient(
+                auth_token=auth.value,
+                base_url=settings.base_url,
+            )
+        if settings.provider == "anthropic_claude":
+            return AnthropicApiClient(
+                auth_token=_safe_resolve_auth().value,
+                base_url=settings.base_url,
+                claude_oauth=True,
+                auth_token_resolver=lambda: settings.resolve_auth().value,
+            )
+        if settings.api_format in ("openai", "openai_compat"):
+            auth = _safe_resolve_auth()
+            return OpenAICompatibleClient(
+                api_key=auth.value,
+                base_url=settings.base_url,
+                timeout=settings.timeout,
+            )
         auth = _safe_resolve_auth()
-        return CodexApiClient(
-            auth_token=auth.value,
-            base_url=settings.base_url,
-        )
-    if settings.provider == "anthropic_claude":
         return AnthropicApiClient(
-            auth_token=_safe_resolve_auth().value,
-            base_url=settings.base_url,
-            claude_oauth=True,
-            auth_token_resolver=lambda: settings.resolve_auth().value,
-        )
-    if settings.api_format in ("openai", "openai_compat"):
-        auth = _safe_resolve_auth()
-        return OpenAICompatibleClient(
             api_key=auth.value,
             base_url=settings.base_url,
-            timeout=settings.timeout,
         )
-    auth = _safe_resolve_auth()
-    return AnthropicApiClient(
-        api_key=auth.value,
-        base_url=settings.base_url,
-    )
+
+    primary = _build_primary()
+
+    # Optimization #4: auto-construct a routed client when
+    # ``settings.provider_routing`` is configured. The routed client
+    # wraps ``primary`` and adds fallback providers; on a retryable
+    # failure (rate limit, 5xx, network) it retries against the next
+    # provider in the chain.
+    routing_config = getattr(settings, "provider_routing", None)
+    if routing_config and isinstance(routing_config, dict):
+        try:
+            from openharness.services.provider_routing import (
+                ProviderRoute,
+                RoutedStreamingClient,
+            )
+
+            fallback_routes: list[ProviderRoute] = []
+            for fallback_cfg in routing_config.get("fallbacks", []):
+                if not isinstance(fallback_cfg, dict):
+                    continue
+                name = fallback_cfg.get("name") or f"fallback_{len(fallback_routes) + 1}"
+                route = _build_fallback_route(name, fallback_cfg)
+                if route is not None:
+                    fallback_routes.append(route)
+            if fallback_routes:
+                # Wrap the primary client as the first route so the
+                # routed client can replay against it on fallback too.
+                primary_route = ProviderRoute(
+                    name=routing_config.get("primary", {}).get("name") or "primary",
+                    client=primary,
+                    delay_seconds=0.0,
+                )
+                return RoutedStreamingClient(primary_route, *fallback_routes)
+        except Exception:
+            # Routing setup must never block the session — fall back to
+            # the unwrapped primary client if anything goes wrong.
+            pass
+
+    return primary
+
+
+def _build_fallback_route(name: str, cfg: dict) -> "ProviderRoute | None":
+    """Construct a fallback ProviderRoute from a routing config dict.
+
+    Config shape: ``{"provider": "openai_compat", "api_format": "openai",
+    "base_url": "...", "api_key": "...", "delay_seconds": 0.0}``.
+    """
+    from openharness.services.provider_routing import ProviderRoute
+    from openharness.api.openai_client import OpenAICompatibleClient
+    from openharness.api.client import AnthropicApiClient
+
+    api_format = (cfg.get("api_format") or "openai").strip().lower()
+    api_key = cfg.get("api_key") or cfg.get("auth_token") or ""
+    base_url = cfg.get("base_url")
+    if not api_key:
+        return None
+    delay = float(cfg.get("delay_seconds", 0.0) or 0.0)
+    if api_format in ("openai", "openai_compat"):
+        client = OpenAICompatibleClient(api_key=api_key, base_url=base_url)
+    elif api_format == "anthropic":
+        client = AnthropicApiClient(api_key=api_key, base_url=base_url)
+    else:
+        return None
+    return ProviderRoute(name=name, client=client, delay_seconds=delay)
 
 
 def _print_auth_resolution_error(settings, exc: Exception) -> None:
@@ -438,6 +508,16 @@ async def build_runtime(
     )
     if autodream_context is not None:
         engine.tool_metadata["autodream_context"] = autodream_context
+    # Apply Kaggle-aware hardware defaults if running on Kaggle and the
+    # user hasn't explicitly overridden them. This auto-raises
+    # ``max_concurrent_agents`` and ``batch_size`` based on detected
+    # CPU + GPU counts so Kaggle users get full hardware utilization
+    # without manual config.
+    try:
+        from openharness.services.kaggle_env import apply_kaggle_defaults_to_settings
+        apply_kaggle_defaults_to_settings(settings)
+    except Exception:
+        pass  # Off-Kaggle or detection failed — use defaults
     # Apply optimization settings: #1 agent concurrency, #7 tool cache.
     try:
         from openharness.services.agent_concurrency import configure_agent_concurrency
