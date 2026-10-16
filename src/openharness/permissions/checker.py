@@ -57,9 +57,16 @@ class PathRule:
 class PermissionChecker:
     """Evaluate tool usage against the configured permission mode and rules."""
 
-    def __init__(self, settings: PermissionSettings) -> None:
+    def __init__(
+        self,
+        settings: PermissionSettings,
+        *,
+        trusted_project: bool = False,
+        project_cwd: str | None = None,
+    ) -> None:
         self._settings = settings
-        # Parse path rules from settings
+        self._trusted_project = trusted_project
+        self._project_cwd = project_cwd.rstrip("/") if project_cwd else None
         self._path_rules: list[PathRule] = []
         for rule in getattr(settings, "path_rules", []):
             pattern = getattr(rule, "pattern", None) or (rule.get("pattern") if isinstance(rule, dict) else None)
@@ -81,10 +88,6 @@ class PermissionChecker:
         command: str | None = None,
     ) -> PermissionDecision:
         """Return whether the tool may run immediately."""
-        # Built-in sensitive path protection — always active, cannot be
-        # overridden by user settings or permission mode.  This is a
-        # defence-in-depth measure against LLM-directed or prompt-injection
-        # driven access to credential files.
         if file_path:
             for candidate_path in _policy_match_paths(file_path):
                 for pattern in SENSITIVE_PATH_PATTERNS:
@@ -97,15 +100,12 @@ class PermissionChecker:
                             ),
                         )
 
-        # Explicit tool deny list
         if tool_name in self._settings.denied_tools:
             return PermissionDecision(allowed=False, reason=f"{tool_name} is explicitly denied")
 
-        # Explicit tool allow list
         if tool_name in self._settings.allowed_tools:
             return PermissionDecision(allowed=True, reason=f"{tool_name} is explicitly allowed")
 
-        # Check path-level rules
         if file_path and self._path_rules:
             for candidate_path in _policy_match_paths(file_path):
                 for rule in self._path_rules:
@@ -116,7 +116,6 @@ class PermissionChecker:
                                 reason=f"Path {file_path} matches deny rule: {rule.pattern}",
                             )
 
-        # Check command deny patterns (e.g. deny "rm -rf /")
         if command:
             for pattern in getattr(self._settings, "denied_commands", []):
                 if isinstance(pattern, str) and fnmatch.fnmatch(command, pattern):
@@ -125,22 +124,29 @@ class PermissionChecker:
                         reason=f"Command matches deny pattern: {pattern}",
                     )
 
-        # Full auto: allow everything
         if self._settings.mode == PermissionMode.FULL_AUTO:
             return PermissionDecision(allowed=True, reason="Auto mode allows all tools")
 
-        # Read-only tools always allowed
         if is_read_only:
             return PermissionDecision(allowed=True, reason="read-only tools are allowed")
 
-        # Plan mode: block mutating tools
         if self._settings.mode == PermissionMode.PLAN:
             return PermissionDecision(
                 allowed=False,
                 reason="Plan mode blocks mutating tools until the user exits plan mode",
             )
 
-        # Default mode: require confirmation for mutating tools
+        # Optimization #6: trusted-project mode auto-approves in-project mutations.
+        if self._trusted_project and self._project_cwd and file_path:
+            if _path_is_inside(file_path, self._project_cwd):
+                return PermissionDecision(
+                    allowed=True,
+                    reason=(
+                        f"Trusted-project mode auto-approved {tool_name} "
+                        f"(target inside {self._project_cwd})"
+                    ),
+                )
+
         bash_hint = _bash_permission_hint(command)
         reason = (
             "Mutating tools require user confirmation in default mode. "
@@ -154,6 +160,29 @@ class PermissionChecker:
             requires_confirmation=True,
             reason=reason,
         )
+
+
+def _path_is_inside(path: str, root: str) -> bool:
+    """Return True if ``path`` is the same as or inside ``root``."""
+    normalized = path.rstrip("/")
+    if normalized == root:
+        return True
+    return normalized.startswith(root + "/")
+
+
+def build_permission_checker(settings, *, cwd: str | None = None) -> PermissionChecker:
+    """Build a PermissionChecker wired to the full Settings.
+
+    Forwards ``settings.trusted_project`` and the project ``cwd`` so
+    trusted-project mode (optimization #6) can auto-approve in-project
+    mutations.
+    """
+    trusted = bool(getattr(settings, "trusted_project", False))
+    return PermissionChecker(
+        settings.permission,
+        trusted_project=trusted,
+        project_cwd=str(cwd) if cwd else None,
+    )
 
 
 def _policy_match_paths(file_path: str) -> tuple[str, ...]:

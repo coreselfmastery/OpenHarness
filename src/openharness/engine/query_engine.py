@@ -50,6 +50,13 @@ class QueryEngine:
         self._effort = settings.effort if settings is not None else None
         self._context_window_tokens = context_window_tokens
         self._auto_compact_threshold_tokens = auto_compact_threshold_tokens
+        # Optimization #5 + #9: forward from settings if not explicitly given.
+        if settings is not None:
+            self._auto_compact_threshold_ratio = getattr(settings, "auto_compact_threshold_ratio", None)
+            self._thinking_budget = getattr(settings, "thinking_budget", None)
+        else:
+            self._auto_compact_threshold_ratio = None
+            self._thinking_budget = None
         self._max_turns = max_turns
         self._permission_prompt = permission_prompt
         self._ask_user_prompt = ask_user_prompt
@@ -255,6 +262,8 @@ class QueryEngine:
             effort=self._effort,
             context_window_tokens=self._context_window_tokens,
             auto_compact_threshold_tokens=self._auto_compact_threshold_tokens,
+            auto_compact_threshold_ratio=self._auto_compact_threshold_ratio,
+            thinking_budget=self._thinking_budget,
             max_turns=self._max_turns,
             permission_prompt=self._permission_prompt,
             ask_user_prompt=self._ask_user_prompt,
@@ -276,6 +285,34 @@ class QueryEngine:
             await self._update_session_memory()
             await self._extract_durable_memories()
             self._schedule_auto_dream()
+            self._auto_save_session()
+
+    def _auto_save_session(self) -> None:
+        """Save a session snapshot when ``settings.auto_save`` is True.
+
+        Implements optimization #10. Writes ``latest.json`` to
+        ``~/.openharness/sessions/<project>-<hash>/`` after every user
+        turn. Failures are logged and swallowed so auto-save never
+        crashes the agent loop.
+        """
+        if self._settings is None or not getattr(self._settings, "auto_save", True):
+            return
+        try:
+            from openharness.services.session_storage import save_session_snapshot
+            save_session_snapshot(
+                cwd=self._cwd,
+                model=self._model,
+                system_prompt=self._system_prompt,
+                messages=list(self._messages),
+                usage=self._cost_tracker.total,
+                session_id=str(self._tool_metadata.get("session_id") or ""),
+                tool_metadata=self._tool_metadata,
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "auto-save snapshot failed", exc_info=True
+            )
 
     async def continue_pending(self, *, max_turns: int | None = None) -> AsyncIterator[StreamEvent]:
         """Continue an interrupted tool loop without appending a new user message."""
@@ -292,6 +329,8 @@ class QueryEngine:
             effort=self._effort,
             context_window_tokens=self._context_window_tokens,
             auto_compact_threshold_tokens=self._auto_compact_threshold_tokens,
+            auto_compact_threshold_ratio=self._auto_compact_threshold_ratio,
+            thinking_budget=self._thinking_budget,
             max_turns=max_turns if max_turns is not None else self._max_turns,
             permission_prompt=self._permission_prompt,
             ask_user_prompt=self._ask_user_prompt,

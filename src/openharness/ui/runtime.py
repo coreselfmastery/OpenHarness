@@ -35,7 +35,7 @@ from openharness.hooks import HookEvent, HookExecutionContext, HookExecutor, loa
 from openharness.hooks.hot_reload import HookReloader
 from openharness.mcp.client import McpClientManager
 from openharness.mcp.config import load_mcp_server_configs
-from openharness.permissions import PermissionChecker
+from openharness.permissions import PermissionChecker, build_permission_checker
 from openharness.plugins import load_plugins
 from openharness.prompts import build_runtime_system_prompt
 from openharness.state import AppState, AppStateStore
@@ -400,7 +400,7 @@ async def build_runtime(
     engine = QueryEngine(
         api_client=resolved_api_client,
         tool_registry=tool_registry,
-        permission_checker=PermissionChecker(settings.permission),
+        permission_checker=build_permission_checker(settings, cwd=str(cwd)),
         cwd=cwd,
         model=settings.model,
         system_prompt=system_prompt_text,
@@ -424,11 +424,31 @@ async def build_runtime(
             "edit_approval_prompt": edit_approval_prompt,
             "vision_model_config": _resolve_vision_config(settings),
             "image_generation_config": _resolve_image_generation_config(settings),
+            # Optimization #3: expose resolved settings to tools (agent_tool
+            # reads auto_context_inject / auto_context_files from here).
+            "settings": settings,
+            # Optimization #8: forward parallel_tools flag to the query loop.
+            "parallel_tools": bool(getattr(settings, "parallel_tools", True)),
+            # Optimization #2: forward batch_size for tools that support it.
+            "batch_size": int(getattr(settings, "batch_size", 1) or 1),
+            # Optimization #1: forward max_concurrent_agents to spawned agents.
+            "max_concurrent_agents": int(getattr(settings, "max_concurrent_agents", 5) or 5),
             **restored_metadata,
         },
     )
     if autodream_context is not None:
         engine.tool_metadata["autodream_context"] = autodream_context
+    # Apply optimization settings: #1 agent concurrency, #7 tool cache.
+    try:
+        from openharness.services.agent_concurrency import configure_agent_concurrency
+        configure_agent_concurrency(settings)
+    except Exception:
+        pass
+    try:
+        from openharness.services.tool_cache import configure_tool_cache_from_settings
+        configure_tool_cache_from_settings(settings)
+    except Exception:
+        pass
     # Restore messages from a saved session if provided
     if restore_messages:
         restored = sanitize_conversation_messages(
@@ -605,7 +625,7 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
         )
     bundle.engine.set_model(settings.model)
     bundle.engine.set_effort(settings.effort)
-    bundle.engine.set_permission_checker(PermissionChecker(settings.permission))
+    bundle.engine.set_permission_checker(build_permission_checker(settings, cwd=str(bundle.engine._cwd)))
     system_prompt = build_runtime_system_prompt(
         settings,
         cwd=bundle.cwd,

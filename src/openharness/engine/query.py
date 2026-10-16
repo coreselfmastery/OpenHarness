@@ -148,6 +148,10 @@ class QueryContext:
     effort: str | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
+    # Optimization #5: compact at this fraction of the context window.
+    auto_compact_threshold_ratio: float | None = None
+    # Optimization #9: per-call reasoning budget for thinking models.
+    thinking_budget: int | None = None
     permission_prompt: PermissionPrompt | None = None
     ask_user_prompt: AskUserPrompt | None = None
     max_turns: int | None = 200
@@ -681,6 +685,7 @@ async def run_query(
                 carryover_metadata=context.tool_metadata,
                 context_window_tokens=context.context_window_tokens,
                 auto_compact_threshold_tokens=context.auto_compact_threshold_tokens,
+                auto_compact_threshold_ratio=context.auto_compact_threshold_ratio,
             )
         )
         while True:
@@ -733,6 +738,7 @@ async def run_query(
                     max_tokens=effective_max_tokens,
                     tools=context.tool_registry.to_api_schema(),
                     effort=context.effort,
+                    thinking_budget=context.thinking_budget,
                 )
             ):
                 if isinstance(event, ApiTextDeltaEvent):
@@ -839,20 +845,29 @@ async def run_query(
             ), None
             tool_results = [result]
         else:
-            # Multiple tools: execute concurrently, emit events after
+            # Multiple tools: execute concurrently, emit events after.
+            # Optimization #8: ``parallel_tools`` flag. When False, run
+            # sequentially (deterministic, for debugging).
+            parallel_tools = bool(
+                (context.tool_metadata or {}).get("parallel_tools", True)
+            )
             for tc in tool_calls:
                 yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
 
             async def _run(tc):
                 return await _execute_tool_call(context, tc.name, tc.id, tc.input)
 
-            # Use return_exceptions=True so a single failing tool does not abandon
-            # its siblings as cancelled coroutines and leave the conversation with
-            # un-replied tool_use blocks (Anthropic's API rejects the next request
-            # on the session if any tool_use is missing a matching tool_result).
-            raw_results = await asyncio.gather(
-                *[_run(tc) for tc in tool_calls], return_exceptions=True
-            )
+            if parallel_tools:
+                raw_results = await asyncio.gather(
+                    *[_run(tc) for tc in tool_calls], return_exceptions=True
+                )
+            else:
+                raw_results = []
+                for tc in tool_calls:
+                    try:
+                        raw_results.append(await _run(tc))
+                    except Exception as exc:
+                        raw_results.append(exc)
             tool_results = []
             for tc, result in zip(tool_calls, raw_results):
                 if isinstance(result, BaseException):
@@ -966,16 +981,34 @@ async def _execute_tool_call(
             )
 
     log.debug("executing %s ...", tool_name)
+    # Optimization #7: check the tool result cache before executing.
+    from openharness.services.tool_cache import get_tool_cache
+    tool_cache = get_tool_cache()
+    if (
+        tool_cache is not None
+        and tool.is_read_only(parsed_input)
+        and tool_cache.is_cacheable(tool_name)
+    ):
+        cached = tool_cache.get(tool_name, dict(tool_input))
+        if cached is not None:
+            log.debug("tool cache HIT for %s", tool_name)
+            return ToolResultBlock(
+                tool_use_id=tool_use_id,
+                content=cached.get("output", ""),
+                is_error=bool(cached.get("is_error", False)),
+                result_metadata=dict(cached.get("metadata") or {}),
+            )
     t0 = time.monotonic()
+    # Build the tool execution metadata, starting from the engine's
+    # ``tool_metadata`` so we carry the mcp_manager, settings, etc.
+    tool_exec_metadata = dict(context.tool_metadata or {})
+    tool_exec_metadata.setdefault("tool_registry", context.tool_registry)
+    tool_exec_metadata.setdefault("ask_user_prompt", context.ask_user_prompt)
     result = await tool.execute(
         parsed_input,
         ToolExecutionContext(
             cwd=context.cwd,
-            metadata={
-                "tool_registry": context.tool_registry,
-                "ask_user_prompt": context.ask_user_prompt,
-                **(context.tool_metadata or {}),
-            },
+            metadata=tool_exec_metadata,
             hook_executor=context.hook_executor,
         ),
     )
@@ -995,6 +1028,24 @@ async def _execute_tool_call(
         is_error=result.is_error,
         result_metadata=dict(result.metadata or {}),
     )
+    # Optimization #7: cache successful read-only results; invalidate on mutating tools.
+    if tool_cache is not None:
+        if tool_cache.is_mutating(tool_name):
+            tool_cache.invalidate_all()
+        elif (
+            tool.is_read_only(parsed_input)
+            and tool_cache.is_cacheable(tool_name)
+            and not tool_result.is_error
+        ):
+            tool_cache.put(
+                tool_name,
+                dict(tool_input),
+                {
+                    "output": tool_result.content,
+                    "is_error": tool_result.is_error,
+                    "metadata": dict(result.metadata or {}),
+                },
+            )
     _record_tool_carryover(
         context,
         tool_name=tool_name,

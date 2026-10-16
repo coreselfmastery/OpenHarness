@@ -605,6 +605,22 @@ class Settings(BaseModel):
     passes: int = 1
     verbose: bool = False
 
+    # --- Performance / scaling settings (top-10 optimizations) ---
+    max_concurrent_agents: int = 5
+    batch_size: int = 1
+    auto_compact_threshold_ratio: float | None = None
+    trusted_project: bool = False
+    tool_cache_enabled: bool = False
+    tool_cache_max_entries: int = 256
+    parallel_tools: bool = True
+    auto_save: bool = True
+    thinking_budget: int | None = None
+    auto_context_inject: bool = True
+    auto_context_files: list[str] = Field(
+        default_factory=lambda: ["BRIEF.md", "STORYBOARD.md", "STYLE.md"]
+    )
+    provider_routing: dict[str, Any] | None = None
+
     # Vision model (image-to-text fallback)
     vision: VisionModelConfig = Field(default_factory=VisionModelConfig)
 
@@ -1033,6 +1049,55 @@ def _apply_env_overrides(settings: Settings) -> Settings:
         ]
     if web_updates:
         updates["web"] = settings.web.model_copy(update=web_updates)
+
+    # --- Top-10 performance / scaling overrides ---
+    max_concurrent_agents = os.environ.get("OPENHARNESS_MAX_CONCURRENT_AGENTS")
+    if max_concurrent_agents:
+        try:
+            updates["max_concurrent_agents"] = max(1, int(max_concurrent_agents))
+        except ValueError:
+            pass
+
+    batch_size_env = os.environ.get("OPENHARNESS_BATCH_SIZE")
+    if batch_size_env:
+        try:
+            updates["batch_size"] = max(1, int(batch_size_env))
+        except ValueError:
+            pass
+
+    compact_ratio = os.environ.get("OPENHARNESS_AUTO_COMPACT_THRESHOLD_RATIO")
+    if compact_ratio:
+        try:
+            updates["auto_compact_threshold_ratio"] = float(compact_ratio)
+        except ValueError:
+            pass
+
+    trusted_project_env = os.environ.get("OPENHARNESS_TRUSTED_PROJECT")
+    if trusted_project_env is not None:
+        updates["trusted_project"] = _parse_bool_env(trusted_project_env)
+
+    tool_cache_env = os.environ.get("OPENHARNESS_TOOL_CACHE")
+    if tool_cache_env is not None:
+        updates["tool_cache_enabled"] = _parse_bool_env(tool_cache_env)
+
+    parallel_tools_env = os.environ.get("OPENHARNESS_PARALLEL_TOOLS")
+    if parallel_tools_env is not None:
+        updates["parallel_tools"] = _parse_bool_env(parallel_tools_env)
+
+    auto_save_env = os.environ.get("OPENHARNESS_AUTO_SAVE")
+    if auto_save_env is not None:
+        updates["auto_save"] = _parse_bool_env(auto_save_env)
+
+    thinking_budget_env = os.environ.get("OPENHARNESS_THINKING_BUDGET")
+    if thinking_budget_env:
+        try:
+            updates["thinking_budget"] = max(0, int(thinking_budget_env))
+        except ValueError:
+            pass
+
+    auto_context_env = os.environ.get("OPENHARNESS_AUTO_CONTEXT_INJECT")
+    if auto_context_env is not None:
+        updates["auto_context_inject"] = _parse_bool_env(auto_context_env)
 
     if not updates:
         return settings

@@ -50,6 +50,19 @@ def _reset_perf_caches():
         _GIT_REPO_CACHE.clear()
     except ImportError:
         pass
+    # Optimization #1: reset agent concurrency semaphore between tests
+    try:
+        from openharness.services.agent_concurrency import reset_agent_concurrency
+        reset_agent_concurrency()
+    except ImportError:
+        pass
+    # Optimization #7: reset the tool result cache between tests
+    try:
+        from openharness.services.tool_cache import disable_tool_cache, reset_tool_cache
+        reset_tool_cache()
+        disable_tool_cache()
+    except ImportError:
+        pass
 
     yield
 
@@ -73,5 +86,16 @@ def _reset_perf_caches():
     try:
         from openharness.tools.glob_tool import _GIT_REPO_CACHE
         _GIT_REPO_CACHE.clear()
+    except ImportError:
+        pass
+    try:
+        from openharness.services.agent_concurrency import reset_agent_concurrency
+        reset_agent_concurrency()
+    except ImportError:
+        pass
+    try:
+        from openharness.services.tool_cache import disable_tool_cache, reset_tool_cache
+        reset_tool_cache()
+        disable_tool_cache()
     except ImportError:
         pass

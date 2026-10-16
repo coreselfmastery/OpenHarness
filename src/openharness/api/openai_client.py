@@ -324,6 +324,14 @@ class OpenAICompatibleClient:
             "stream_options": {"include_usage": True},
         }
         params.update(_token_limit_param_for_model(request.model, request.max_tokens))
+        # Optimization #9: forward thinking_budget to reasoning-capable models.
+        if request.thinking_budget is not None and request.thinking_budget > 0:
+            if request.thinking_budget <= 2048:
+                params["reasoning_effort"] = "low"
+            elif request.thinking_budget <= 8192:
+                params["reasoning_effort"] = "medium"
+            else:
+                params["reasoning_effort"] = "high"
         if openai_tools:
             params["tools"] = openai_tools
             # Some providers (Kimi) error on empty reasoning_content in

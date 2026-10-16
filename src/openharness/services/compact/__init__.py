@@ -1111,11 +1111,22 @@ def get_autocompact_threshold(
     *,
     context_window_tokens: int | None = None,
     auto_compact_threshold_tokens: int | None = None,
+    auto_compact_threshold_ratio: float | None = None,
 ) -> int:
-    """Calculate the token count at which auto-compact fires."""
+    """Calculate the token count at which auto-compact fires.
+
+    Precedence (highest first):
+    1. ``auto_compact_threshold_tokens`` — explicit absolute token count.
+    2. ``auto_compact_threshold_ratio`` — fraction of the context window
+       (e.g. ``0.60`` compacts at 60% of the window). Implements
+       optimization #5 from the top-10 list.
+    3. Default heuristic (window − reserved − buffer).
+    """
     if auto_compact_threshold_tokens is not None and auto_compact_threshold_tokens > 0:
         return int(auto_compact_threshold_tokens)
     context_window = get_context_window(model, context_window_tokens=context_window_tokens)
+    if auto_compact_threshold_ratio is not None and 0.0 < auto_compact_threshold_ratio < 1.0:
+        return max(1, int(context_window * auto_compact_threshold_ratio))
     reserved = min(MAX_OUTPUT_TOKENS_FOR_SUMMARY, 20_000)
     effective = context_window - reserved
     return effective - AUTOCOMPACT_BUFFER_TOKENS
@@ -1128,6 +1139,7 @@ def should_autocompact(
     *,
     context_window_tokens: int | None = None,
     auto_compact_threshold_tokens: int | None = None,
+    auto_compact_threshold_ratio: float | None = None,
 ) -> bool:
     """Return True when the conversation should be auto-compacted."""
     if state.consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES:
@@ -1137,6 +1149,7 @@ def should_autocompact(
         model,
         context_window_tokens=context_window_tokens,
         auto_compact_threshold_tokens=auto_compact_threshold_tokens,
+        auto_compact_threshold_ratio=auto_compact_threshold_ratio,
     )
     return token_count >= threshold
 
@@ -1523,6 +1536,7 @@ async def auto_compact_if_needed(
     carryover_metadata: dict[str, Any] | None = None,
     context_window_tokens: int | None = None,
     auto_compact_threshold_tokens: int | None = None,
+    auto_compact_threshold_ratio: float | None = None,
 ) -> tuple[list[ConversationMessage], bool]:
     """Check if auto-compact should fire, and if so, compact.
 
@@ -1537,6 +1551,7 @@ async def auto_compact_if_needed(
         state,
         context_window_tokens=context_window_tokens,
         auto_compact_threshold_tokens=auto_compact_threshold_tokens,
+        auto_compact_threshold_ratio=auto_compact_threshold_ratio,
     ):
         return messages, False
 
@@ -1566,6 +1581,7 @@ async def auto_compact_if_needed(
         state,
         context_window_tokens=context_window_tokens,
         auto_compact_threshold_tokens=auto_compact_threshold_tokens,
+        auto_compact_threshold_ratio=auto_compact_threshold_ratio,
     ):
         log.info("Microcompact freed ~%d tokens, auto-compact no longer needed", tokens_freed)
         return messages, True
@@ -1607,6 +1623,7 @@ async def auto_compact_if_needed(
             state,
             context_window_tokens=context_window_tokens,
             auto_compact_threshold_tokens=auto_compact_threshold_tokens,
+            auto_compact_threshold_ratio=auto_compact_threshold_ratio,
         ):
             return messages, True
 

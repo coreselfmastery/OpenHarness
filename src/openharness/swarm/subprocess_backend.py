@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from openharness.swarm.spawn_utils import (
     build_inherited_cli_flags,
@@ -85,8 +85,11 @@ class SubprocessBackend:
                 argv = [teammate_cmd, "--task-worker"] + flags
 
         manager = get_task_manager()
-        try:
-            record = await manager.create_agent_task(
+        # Optimization #1: acquire the agent concurrency semaphore before spawning.
+        from openharness.services.agent_concurrency import with_agent_limit
+
+        async def _do_spawn() -> Any:
+            return await manager.create_agent_task(
                 prompt=config.prompt,
                 description=f"Teammate: {agent_id}",
                 cwd=config.cwd,
@@ -96,6 +99,9 @@ class SubprocessBackend:
                 argv=argv,
                 env=extra_env,
             )
+
+        try:
+            record = await with_agent_limit(_do_spawn)
         except Exception as exc:
             logger.error("Failed to spawn teammate %s: %s", agent_id, exc)
             return SpawnResult(

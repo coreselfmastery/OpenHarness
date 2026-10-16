@@ -46,6 +46,8 @@ class ApiMessageRequest:
     max_tokens: int = 4096
     tools: list[dict[str, Any]] = field(default_factory=list)
     effort: str | None = None
+    # Optimization #9: per-call reasoning budget for thinking models.
+    thinking_budget: int | None = None
 
 
 @dataclass(frozen=True)

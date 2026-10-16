@@ -2236,6 +2236,20 @@ def main(
         help="Maximum number of agentic turns (enforced by default in --print; optional cap for interactive mode)",
         rich_help_panel="Model & Effort",
     ),
+    thinking_budget: int | None = typer.Option(
+        None,
+        "--thinking-budget",
+        # Optimization #9: forward to settings via env var so the engine
+        # picks it up through the normal env-override path. We use a
+        # callback so the flag works on every subcommand.
+        callback=lambda val: (
+            os.environ.__setitem__("OPENHARNESS_THINKING_BUDGET", str(val))
+            if val is not None
+            else None
+        ) if val is not None else None,
+        help="Per-call reasoning token budget for thinking models (o1/o3/gpt-5). 0 = no reasoning.",
+        rich_help_panel="Model & Effort",
+    ),
     # --- Output ---
     print_mode: str | None = typer.Option(
         None,

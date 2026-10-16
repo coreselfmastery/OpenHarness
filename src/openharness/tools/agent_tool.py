@@ -49,6 +49,22 @@ class AgentTool(BaseTool):
                 is_error=True,
             )
 
+        # Optimization #3: auto-inject project context (STYLE.md / STORYBOARD.md / BRIEF.md).
+        from openharness.services.auto_context import (
+            get_auto_context_files,
+            inject_auto_context,
+            is_auto_context_enabled,
+        )
+        settings = context.metadata.get("settings") if context.metadata else None
+        auto_enabled = is_auto_context_enabled(settings)
+        auto_files = get_auto_context_files(settings)
+        effective_prompt = inject_auto_context(
+            arguments.prompt,
+            str(context.cwd),
+            candidates=auto_files,
+            enabled=auto_enabled,
+        )
+
         # Look up agent definition if subagent_type is specified
         agent_def = None
         if arguments.subagent_type:
@@ -68,7 +84,7 @@ class AgentTool(BaseTool):
         config = TeammateSpawnConfig(
             name=agent_name,
             team=team,
-            prompt=arguments.prompt,
+            prompt=effective_prompt,
             cwd=str(context.cwd),
             parent_session_id="main",
             model=arguments.model or (agent_def.model if agent_def else None),
