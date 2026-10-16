@@ -31,6 +31,24 @@ from openharness.services.tool_cache import (
 # Fix #1: Multi-provider routing is auto-wired
 # ============================================================
 
+def _unwrap_pipeline(client):
+    """Peel the inference-pipeline wrapper (item #2/#3/#18) to reach the
+    underlying transport client.
+
+    Since the waves 2-6 wiring, ``_resolve_api_client_from_settings``
+    wraps every client with ``InferencePipelineClient`` (prefix caching
+    is on by default). The routing/plain-client assertions below must
+    therefore look at the unwrapped transport.
+    """
+    from openharness.services.llm_pipeline import InferencePipelineClient
+
+    for _ in range(5):  # bounded unwrap, wrappers are at most 3 deep
+        if isinstance(client, InferencePipelineClient):
+            client = client._inner
+        else:
+            break
+    return client
+
 def test_fix_1_routing_auto_wired_when_provider_routing_configured():
     """Item 1: when settings.provider_routing is set, the runtime builds a RoutedStreamingClient."""
     from openharness.ui.runtime import _resolve_api_client_from_settings
@@ -54,7 +72,7 @@ def test_fix_1_routing_auto_wired_when_provider_routing_configured():
         },
     )
     settings.active_profile = "openai-compatible"
-    client = _resolve_api_client_from_settings(settings)
+    client = _unwrap_pipeline(_resolve_api_client_from_settings(settings))
     assert isinstance(client, RoutedStreamingClient), (
         f"Expected RoutedStreamingClient, got {type(client).__name__}"
     )
@@ -79,7 +97,7 @@ def test_fix_1_no_routing_returns_plain_client():
     # Force the active profile to an openai-compatible one so the runtime
     # picks OpenAICompatibleClient as the primary.
     settings.active_profile = "openai-compatible"
-    client = _resolve_api_client_from_settings(settings)
+    client = _unwrap_pipeline(_resolve_api_client_from_settings(settings))
     assert isinstance(client, OpenAICompatibleClient), (
         f"Expected OpenAICompatibleClient when no routing configured, got {type(client).__name__}"
     )
@@ -104,7 +122,7 @@ def test_fix_1_routing_skips_fallbacks_with_missing_api_key():
         },
     )
     settings.active_profile = "openai-compatible"
-    client = _resolve_api_client_from_settings(settings)
+    client = _unwrap_pipeline(_resolve_api_client_from_settings(settings))
     # With no valid fallbacks, should return the primary client unwrapped
     assert isinstance(client, OpenAICompatibleClient)
 

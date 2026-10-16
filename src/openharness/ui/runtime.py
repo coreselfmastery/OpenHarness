@@ -278,6 +278,12 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
     If ``settings.provider_routing`` is configured (optimization #4),
     the returned client is a :class:`RoutedStreamingClient` that tries
     the primary provider first and falls back on retryable errors.
+
+    Finally the client is wrapped with the inference pipeline
+    (``services.llm_pipeline``): Anthropic prefix-caching breakpoints
+    (#2), prompt compression (#3), cross-provider racing (#4), the
+    API-key rotation pool (#6) and the semantic cache (#18) — each only
+    when enabled in ``settings.inference``.
     """
     # Ensure profile fields (base_url, model, api_format) are projected to settings
     settings = settings.materialize_active_profile()
@@ -289,7 +295,7 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             _print_auth_resolution_error(settings, exc)
             raise SystemExit(1)
 
-    def _build_primary() -> SupportsStreamingMessages:
+    def _build_primary(api_key_override: str | None = None) -> SupportsStreamingMessages:
         if settings.api_format == "copilot":
             from openharness.api.copilot_client import COPILOT_DEFAULT_MODEL
 
@@ -300,6 +306,11 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             )
             return CopilotClient(model=copilot_model)
         if settings.provider == "openai_codex":
+            if api_key_override is not None:
+                return CodexApiClient(
+                    auth_token=api_key_override,
+                    base_url=settings.base_url,
+                )
             auth = _safe_resolve_auth()
             return CodexApiClient(
                 auth_token=auth.value,
@@ -313,11 +324,22 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
                 auth_token_resolver=lambda: settings.resolve_auth().value,
             )
         if settings.api_format in ("openai", "openai_compat"):
+            if api_key_override is not None:
+                return OpenAICompatibleClient(
+                    api_key=api_key_override,
+                    base_url=settings.base_url,
+                    timeout=settings.timeout,
+                )
             auth = _safe_resolve_auth()
             return OpenAICompatibleClient(
                 api_key=auth.value,
                 base_url=settings.base_url,
                 timeout=settings.timeout,
+            )
+        if api_key_override is not None:
+            return AnthropicApiClient(
+                api_key=api_key_override,
+                base_url=settings.base_url,
             )
         auth = _safe_resolve_auth()
         return AnthropicApiClient(
@@ -359,13 +381,75 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
                     client=primary,
                     delay_seconds=0.0,
                 )
-                return RoutedStreamingClient(primary_route, *fallback_routes)
+                routed = RoutedStreamingClient(primary_route, *fallback_routes)
+                # The inference pipeline wraps the routed client; the
+                # fallback routes also participate in racing (#4) when
+                # the user opted in.
+                return _wrap_with_inference_pipeline(settings, routed, fallback_routes)
+            # No fallbacks configured — fall through to the inference
+            # pipeline wrapper below with an empty route list.
+            return _wrap_with_inference_pipeline(settings, primary, [])
         except Exception:
             # Routing setup must never block the session — fall back to
             # the unwrapped primary client if anything goes wrong.
-            pass
+            return primary
 
-    return primary
+    return _wrap_with_inference_pipeline(settings, primary, [])
+
+
+def _wrap_with_inference_pipeline(
+    settings,
+    primary: SupportsStreamingMessages,
+    fallback_routes: list,
+) -> SupportsStreamingMessages:
+    """Wrap ``primary`` with the enabled inference features (#1-#6, #18).
+
+    Degradates to identity when nothing is enabled. ``fallback_routes``
+    are the provider-routing fallbacks (``ProviderRoute`` objects); when
+    cross-provider racing (#4) is on they participate in the race.
+    """
+    try:
+        from openharness.services.llm_pipeline import wrap_client_with_inference_pipeline
+
+        inference = getattr(settings, "inference", None)
+        # A key-rotation factory is only meaningful for providers whose
+        # auth is a plain API key (subscription/copilot auth cannot rotate).
+        client_factory = None
+        if inference is not None and getattr(inference, "api_key_pool", None):
+            if settings.provider not in {"anthropic_claude"} and settings.api_format != "copilot":
+                client_factory = lambda api_key: _build_primary_with_overrides(settings, api_key)
+        racing_routes = [
+            (route.name, route.client) for route in fallback_routes if route.client is not None
+        ]
+        return wrap_client_with_inference_pipeline(
+            settings,
+            primary,
+            fallback_routes=racing_routes or None,
+            client_factory=client_factory,
+        )
+    except Exception:
+        # Inference wrapping must never block the session.
+        return primary
+
+
+def _build_primary_with_overrides(settings, api_key: str) -> SupportsStreamingMessages:
+    """Rebuild the primary client with an explicit API key (#6 pool)."""
+    materialized = settings.materialize_active_profile()
+    if materialized.api_format == "copilot":
+        return CopilotClient(model=materialized.model)
+    if materialized.provider == "openai_codex":
+        return CodexApiClient(auth_token=api_key, base_url=materialized.base_url)
+    if materialized.provider == "anthropic_claude":
+        return AnthropicApiClient(
+            auth_token=api_key, base_url=materialized.base_url, claude_oauth=True
+        )
+    if materialized.api_format in ("openai", "openai_compat"):
+        return OpenAICompatibleClient(
+            api_key=api_key,
+            base_url=materialized.base_url,
+            timeout=materialized.timeout,
+        )
+    return AnthropicApiClient(api_key=api_key, base_url=materialized.base_url)
 
 
 def _print_auth_resolution_error(settings, exc: Exception) -> None:
@@ -445,6 +529,21 @@ async def build_runtime(
     normalized_skill_dirs = tuple(str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ()))
     normalized_plugin_roots = tuple(str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ()))
     plugins = load_plugins(settings, cwd, extra_roots=normalized_plugin_roots)
+    # Waves 2-6 session services (#20, #26-#40): audit log, control bus,
+    # watchdog, deadlock probes, cost tracker, model cache, render
+    # pipeline hooks, graceful-shutdown hooks. Must run BEFORE the API
+    # client is built (the model cache redirects HF env vars at import
+    # time) and before the engine loop starts (watchdog tasks).
+    from openharness.services.session_services import bootstrap_session_services
+
+    # One session id shared by the bootstrap services (audit entries,
+    # checkpoints, control records) and the engine metadata.
+    from uuid import uuid4
+
+    session_id = uuid4().hex[:12]
+    session_services = bootstrap_session_services(
+        settings, session_id=session_id, cwd=cwd
+    )
     if api_client:
         resolved_api_client = api_client
     else:
@@ -509,9 +608,6 @@ async def build_runtime(
     brand_section = _build_brand_anchor_section(cwd)
     if brand_section:
         system_prompt_text = f"{system_prompt_text}\n\n{brand_section}"
-    from uuid import uuid4
-
-    session_id = uuid4().hex[:12]
 
     restored_metadata = {
         "permission_mode": settings.permission.mode.value,
@@ -552,6 +648,8 @@ async def build_runtime(
         ask_user_prompt=ask_user_prompt,
         hook_executor=hook_executor,
         settings=settings,
+        control_bus=session_services.bus,
+        session_cost_tracker=session_services.cost_tracker,
         tool_metadata={
             "mcp_manager": mcp_manager,
             "bridge_manager": bridge_manager,
@@ -575,6 +673,11 @@ async def build_runtime(
             **restored_metadata,
         },
     )
+    # The checkpoint tool (#37) needs a live reference to the engine so it
+    # can snapshot and roll back the conversation. The key starts with an
+    # underscore and is skipped by session snapshot serialization
+    # (metadata is whitelisted there) and by checkpoint persistence.
+    engine.tool_metadata["engine_ref"] = engine
     if autodream_context is not None:
         engine.tool_metadata["autodream_context"] = autodream_context
     # Apply Kaggle-aware hardware defaults if running on Kaggle and the
@@ -600,10 +703,31 @@ async def build_runtime(
         pass
     # Restore messages from a saved session if provided
     if restore_messages:
-        restored = sanitize_conversation_messages(
-            [ConversationMessage.model_validate(m) for m in restore_messages]
-        )
-        engine.load_messages(restored)
+        # Item #33: validate + repair the restored conversation before it
+        # enters the engine (orphan tool results, unanswered tool_use,
+        # corrupt entries) — explicit about everything it changed.
+        control_settings = getattr(settings, "control", None)
+        state_validation = bool(
+            getattr(control_settings, "state_validation", True)
+        ) if control_settings is not None else True
+        if state_validation:
+            from openharness.services.state_validator import validate_restored_payload
+
+            repaired_messages, report = validate_restored_payload({"messages": restore_messages})
+            if report.findings:
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "session restore validation (%d finding(s)): %s",
+                    len(report.findings),
+                    "; ".join(report.findings),
+                )
+            engine.load_messages(repaired_messages)
+        else:
+            restored = sanitize_conversation_messages(
+                [ConversationMessage.model_validate(m) for m in restore_messages]
+            )
+            engine.load_messages(restored)
 
     # Start Docker sandbox if configured
     if settings.sandbox.enabled and settings.sandbox.backend == "docker":
@@ -659,6 +783,17 @@ async def close_runtime(bundle: RuntimeBundle) -> None:
         update_rules_from_session(bundle.engine.messages)
     except Exception:
         pass  # personalization is best-effort, never block session end
+
+    # Item #32: graceful shutdown — drain in-flight renders, close the
+    # persistent store, write the final audit entry. Runs before the MCP
+    # manager and API client are torn down so background work finishes
+    # against live connections.
+    try:
+        from openharness.services.session_services import shutdown_session_services
+
+        await shutdown_session_services()
+    except Exception:
+        pass  # shutdown must never block session end
 
     await bundle.mcp_manager.close()
     await bundle.hook_executor.execute(

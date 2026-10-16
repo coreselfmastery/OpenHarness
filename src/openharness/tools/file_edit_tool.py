@@ -45,6 +45,22 @@ class FileEditTool(BaseTool):
         if not path.exists():
             return ToolResult(output=f"File not found: {path}", is_error=True)
 
+        # Item #31: hold the cross-agent lock across the whole
+        # read-modify-write so concurrent edits cannot interleave.
+        from openharness.services.conflict_resolution import FileConflictError
+
+        try:
+            async with _edit_path_lock(context, path):
+                return await self._execute_locked(arguments, context, path)
+        except FileConflictError as exc:
+            return ToolResult(output=f"Edit blocked: {exc}", is_error=True)
+
+    async def _execute_locked(
+        self,
+        arguments: FileEditToolInput,
+        context: ToolExecutionContext,
+        path: Path,
+    ) -> ToolResult:
         original = path.read_text(encoding="utf-8")
         if arguments.old_str not in original:
             return ToolResult(output="old_str was not found in the file", is_error=True)
@@ -66,6 +82,29 @@ class FileEditTool(BaseTool):
 
         path.write_text(updated, encoding="utf-8")
         return ToolResult(output=f"Updated {path}")
+
+
+def _edit_path_lock(context: ToolExecutionContext, path: Path):
+    """Return the cross-agent lock context for ``path`` when enabled (#31)."""
+    from contextlib import nullcontext
+
+    settings = (context.metadata or {}).get("settings")
+    try:
+        from openharness.services.conflict_resolution import (
+            acquire_path_lock,
+            configure_file_locking_from_settings,
+            lock_timeout_from_settings,
+        )
+
+        if not configure_file_locking_from_settings(settings):
+            return nullcontext()
+        return acquire_path_lock(
+            path,
+            timeout_seconds=lock_timeout_from_settings(settings),
+            holder_label="openharness edit_file",
+        )
+    except Exception:
+        return nullcontext()
 
 
 def _resolve_path(base: Path, candidate: str) -> Path:

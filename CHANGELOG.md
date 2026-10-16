@@ -8,6 +8,12 @@ The format is based on Keep a Changelog, and this project currently tracks chang
 
 ### Added
 
+- Performance & safety feature surface (items #1-#50), all wired into the live runtime and opt-in via the new `inference`, `rendering`, `qa`, `control`, and `model_cache` settings groups (env overrides: `OPENHARNESS_PREFIX_CACHING`, `OPENHARNESS_SEMANTIC_CACHE`, `OPENHARNESS_CROSS_PROVIDER_RACING`, `OPENHARNESS_CONTROL`, `OPENHARNESS_RENDER_CACHE`, and more — see MIGRATION.md):
+  - **Inference pipeline** (`services.llm_pipeline`, wrapped around every API client): Anthropic prompt-caching breakpoints on system + tools (on by default; cache tokens reported in `UsageSnapshot`), lossless prompt compression for old turns, MinHash semantic response cache with SQLite persistence, cross-provider racing, and API-key rotation pools on rate limits.
+  - **Render pipeline** (`services.render_pipeline` + `services.render_cache`): parallel scene rendering across N workers, draft-first QA gating with quality early-exit, fingerprint-based render cache persisted across sessions, NVENC detection with real probe encode, dependency-graph scene ordering with work stealing.
+  - **Control plane** (`services.control_bus`, `services.audit_log`, `services.checkpoints`, `services.progress_tracker`, `services.conflict_resolution`, `services.state_validator`, `services.session_services`): kill switch, pause gate, watchdog, per-stage timeouts, injected human messages at turn boundaries, JSONL audit log of every LLM/tool call, conversation checkpoints with rollback, whole-pipeline scene progress tracking, cross-agent file locking for `edit_file`/`write_file`, and saved-session repair on resume.
+  - **Nine new tools**: `render_scenes`, `render_queue_status`, `qa_review`, `control`, `checkpoint`, `progress`, `audio_gen` (real TTS through OpenAI-compatible `/audio/speech` endpoints), `server_config`, `cache_stats`.
+  - `UsageSnapshot` now carries `cache_write_tokens` / `cache_read_tokens` for provider prompt-cache accounting.
 - Hooks now support a `priority` field (default `0`). Within an event, hooks run highest-priority first, and hooks sharing a priority keep their registration order. This lets users order, for example, a security-check hook ahead of a logging hook regardless of where each is declared in settings or contributed by plugins.
 - `edit_file` and `write_file` in the React TUI now preview a unified diff before applying file changes, let users approve once or for the rest of the session, and skip the extra prompt automatically in `full_auto` mode.
 

@@ -41,7 +41,7 @@ from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
 from openharness.services.tool_outputs import tool_output_inline_chars, tool_output_preview_chars
 from openharness.tools.base import ToolExecutionContext
-from openharness.tools.base import ToolRegistry
+from openharness.tools.base import ToolRegistry, ToolResult
 
 AUTO_COMPACT_STATUS_MESSAGE = "Auto-compacting conversation memory to keep things fast and focused."
 REACTIVE_COMPACT_STATUS_MESSAGE = "Prompt too long; compacting conversation memory and retrying."
@@ -157,6 +157,12 @@ class QueryContext:
     max_turns: int | None = 200
     hook_executor: HookExecutor | None = None
     tool_metadata: dict[str, object] | None = None
+    # Waves 2-6 control plane (#26-#40). All optional; the loop behaves
+    # exactly as before when they are None/0.
+    control_bus: object | None = None
+    session_cost_tracker: object | None = None
+    tool_timeout_seconds: float = 0.0
+    checkpoint_interval_turns: int = 0
 
 
 def _append_capped_unique(bucket: list[Any], value: Any, *, limit: int) -> None:
@@ -704,6 +710,30 @@ async def run_query(
     turn_count = 0
     while context.max_turns is None or turn_count < context.max_turns:
         turn_count += 1
+        # --- control plane (#26/#30/#35/#36): turn-boundary checks -----
+        bus = context.control_bus
+        if bus is not None:
+            if bus.killed:
+                # In-flight work has finished; abort before the next LLM
+                # call so the session ends cleanly instead of hanging.
+                yield ErrorEvent(
+                    message=f"Session aborted by kill switch: {bus.kill_reason or 'no reason recorded'}"
+                ), None
+                return
+            await bus.wait_if_paused()  # #30: block here while paused
+            injected = bus.drain_injected_messages()  # #35: human override
+            if injected:
+                messages.append(
+                    ConversationMessage.from_user_text("\n\n---\n\n".join(injected))
+                )
+                yield StatusEvent(
+                    message=(
+                        f"{len(injected)} injected human message(s) appended "
+                        "at the turn boundary."
+                    )
+                ), None
+            bus.feed("turn")  # #36: watchdog progress signal
+        # ----------------------------------------------------------------
         if effective_max_tokens != context.max_tokens and not reported_token_clamp:
             reported_token_clamp = True
             yield StatusEvent(
@@ -806,6 +836,22 @@ async def run_query(
             return
 
         messages.append(final_message)
+        # --- cost tracking + audit (#28/#29) + auto-checkpoint (#37) ---
+        _record_llm_usage(context, usage)
+        cost_alert = _record_cost_and_alert(context, usage)
+        if cost_alert is not None:
+            yield StatusEvent(message=cost_alert.message), None
+            if cost_alert.level == "halt":
+                yield ErrorEvent(message="Session halted: cost budget exceeded."), None
+                return
+        if context.control_bus is not None:
+            context.control_bus.feed("llm")
+        if (
+            context.checkpoint_interval_turns > 0
+            and turn_count % context.checkpoint_interval_turns == 0
+        ):
+            _auto_checkpoint(context, messages, turn_count)
+        # ----------------------------------------------------------------
         yield AssistantTurnComplete(message=final_message, usage=usage), usage
 
         if coordinator_context_message is not None:
@@ -897,6 +943,111 @@ async def run_query(
     if context.max_turns is not None:
         raise MaxTurnsExceeded(context.max_turns)
     raise RuntimeError("Query loop exited without a max_turns limit or final response")
+
+
+def _record_llm_usage(context: QueryContext, usage: UsageSnapshot) -> None:
+    """Audit-log one completed LLM turn (#29). Never raises."""
+    try:
+        from openharness.services.audit_log import get_audit_log
+
+        get_audit_log().record_llm_call(
+            model=context.model,
+            input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            cache_read_tokens=int(getattr(usage, "cache_read_tokens", 0) or 0),
+            duration_seconds=0.0,
+        )
+    except Exception:
+        pass
+
+
+def _record_cost_and_alert(context: QueryContext, usage: UsageSnapshot):
+    """Feed the session cost tracker (#28); return an alert when crossed."""
+    tracker = context.session_cost_tracker
+    if tracker is None or usage is None:
+        return None
+    try:
+        return tracker.record(context.model, usage)
+    except Exception:
+        return None
+
+
+def _auto_checkpoint(context: QueryContext, messages: list[ConversationMessage], turn: int) -> None:
+    """Snapshot the conversation every N turns (#37). Never raises."""
+    try:
+        from openharness.services.checkpoints import CheckpointManager
+
+        session_id = str((context.tool_metadata or {}).get("session_id") or "default")
+        manager = CheckpointManager(session_id)
+        manager.create(list(messages), label=f"auto turn {turn}")
+    except Exception:
+        log.debug("auto-checkpoint failed", exc_info=True)
+
+
+# Tools that legitimately block on humans or manage their own deadlines;
+# the generic #27 stage timeout does not apply to them.
+_TOOLS_WITH_OWN_TIME = {
+    "ask_user_question",   # waits for a human reply
+    "send_message",        # waits for IM delivery
+    "agent",               # runs a full sub-agent with its own budget
+    "task_output",         # streams a background task
+    "sleep",               # intentional delay, bounded by its own input
+    "render_scenes",       # per-job timeouts inside the render pipeline
+    "qa_review",           # per-call timeouts inside the QA pipeline
+    "audio_gen",           # endpoint timeout inside the generator
+    "remote_trigger",      # external runner with its own lifecycle
+}
+
+
+async def _guarded_tool_execute(
+    context: QueryContext,
+    tool: Any,
+    parsed_input: Any,
+    exec_context: Any,
+):
+    """Run ``tool.execute`` with the #27 stage timeout, #29 audit and
+    #36 watchdog feed. Timeouts surface as error results, never crashes."""
+    from openharness.services.audit_log import get_audit_log
+
+    t0 = time.monotonic()
+    bus = context.control_bus
+    timeout = (
+        context.tool_timeout_seconds
+        if context.tool_timeout_seconds > 0 and tool.name not in _TOOLS_WITH_OWN_TIME
+        else 0.0
+    )
+    is_error = False
+    try:
+        if timeout > 0 and bus is not None:
+            result = await bus.call_with_limit(
+                tool.execute(parsed_input, exec_context),
+                timeout_seconds=timeout,
+                stage=f"tool:{tool.name}",
+            )
+        else:
+            result = await tool.execute(parsed_input, exec_context)
+        is_error = bool(result.is_error)
+        return result
+    except Exception as exc:
+        # StageTimeoutExceeded (#27) or any tool-level failure becomes an
+        # error result so the model can react instead of the loop dying.
+        is_error = True
+        return ToolResult(
+            output=f"{tool.name} aborted: {type(exc).__name__}: {exc}",
+            is_error=True,
+        )
+    finally:
+        elapsed = time.monotonic() - t0
+        try:
+            get_audit_log().record_tool_call(
+                tool=tool.name,
+                is_error=is_error,
+                duration_seconds=elapsed,
+            )
+        except Exception:
+            pass
+        if bus is not None:
+            bus.feed(f"tool:{tool.name}")
 
 
 async def _execute_tool_call(
@@ -998,7 +1149,9 @@ async def _execute_tool_call(
             tool_exec_metadata_inner = dict(context.tool_metadata or {})
             tool_exec_metadata_inner.setdefault("tool_registry", context.tool_registry)
             tool_exec_metadata_inner.setdefault("ask_user_prompt", context.ask_user_prompt)
-            inner_result = await tool.execute(
+            inner_result = await _guarded_tool_execute(
+                context,
+                tool,
                 parsed_input,
                 ToolExecutionContext(
                     cwd=context.cwd,
@@ -1046,7 +1199,9 @@ async def _execute_tool_call(
     tool_exec_metadata = dict(context.tool_metadata or {})
     tool_exec_metadata.setdefault("tool_registry", context.tool_registry)
     tool_exec_metadata.setdefault("ask_user_prompt", context.ask_user_prompt)
-    result = await tool.execute(
+    result = await _guarded_tool_execute(
+        context,
+        tool,
         parsed_input,
         ToolExecutionContext(
             cwd=context.cwd,

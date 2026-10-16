@@ -28,6 +28,17 @@ from openharness.tools.lsp_tool import LspTool
 from openharness.tools.mcp_auth_tool import McpAuthTool
 from openharness.tools.mcp_tool import McpToolAdapter
 from openharness.tools.notebook_edit_tool import NotebookEditTool
+from openharness.tools.pipeline_tools import (
+    AudioGenTool,
+    CacheStatsTool,
+    CheckpointTool,
+    ControlTool,
+    ProgressTool,
+    QAReviewTool,
+    RenderQueueStatusTool,
+    RenderScenesTool,
+    ServerConfigTool,
+)
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 from openharness.tools.remote_trigger_tool import RemoteTriggerTool
 from openharness.tools.send_message_tool import SendMessageTool
@@ -104,6 +115,16 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         DeterminismCheckerTool(),
         ContactSheetTool(),
         EngineRouterTool(),
+        # Waves 2-6 pipeline tools (#1-#50 feature surface)
+        RenderScenesTool(),
+        RenderQueueStatusTool(),
+        QAReviewTool(),
+        ControlTool(),
+        CheckpointTool(),
+        ProgressTool(),
+        AudioGenTool(),
+        ServerConfigTool(),
+        CacheStatsTool(),
     ):
         registry.register(tool)
     if mcp_manager is not None:

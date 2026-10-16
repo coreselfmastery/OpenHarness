@@ -171,6 +171,17 @@ class BatchSceneTool(BaseTool):
 
         batch_id = arguments.batch_id or f"batch_{int(time.time())}"
 
+        # Items #38/#39: mark the requested scenes as "generating" in the
+        # progress tracker (best-effort — the tracker never breaks tools).
+        try:
+            from openharness.services.progress_tracker import get_progress_tracker
+
+            tracker = get_progress_tracker()
+            for index in range(1, len(arguments.scenes) + 1):
+                tracker.mark(f"{arguments.file_prefix}{index:03d}", "generating")
+        except Exception:
+            pass
+
         # Step 1: Call the LLM with the batch prompt
         try:
             raw_response = await self._call_llm(arguments, config, context)
@@ -274,7 +285,11 @@ class BatchSceneTool(BaseTool):
                     "error": f"write failed: {exc}",
                 })
 
-        # Step 4: Build summary
+        # Step 4: Progress tracking + optional render auto-enqueue (#21,
+        # #38, #39) + background asset prefetch (#23).
+        self._post_generation_hooks(context, written, failed, arguments, output_dir)
+
+        # Step 5: Build summary
         summary_lines = [
             "[Batch scene generation complete]",
             f"Batch ID: {batch_id}",
@@ -305,6 +320,83 @@ class BatchSceneTool(BaseTool):
                 "total_scenes": len(arguments.scenes),
             },
         )
+
+    def _post_generation_hooks(
+        self,
+        context: ToolExecutionContext,
+        written: list[str],
+        failed: list[dict[str, Any]],
+        arguments: BatchSceneToolInput,
+        output_dir: Path,
+    ) -> None:
+        """After-generation wiring. Best-effort; never breaks the tool.
+
+        - #38/#39: move written scenes to ``generated`` and failed ones to
+          ``failed`` in the progress tracker.
+        - #21: when ``settings.rendering.auto_enqueue_renders`` is on,
+          submit every written scene to the render pipeline immediately
+          (draft tier when draft-first is on) so generation and rendering
+          overlap instead of running back to back.
+        - #23: warm the read cache for referenced assets in the background.
+        """
+        try:
+            from openharness.services.progress_tracker import get_progress_tracker
+
+            tracker = get_progress_tracker()
+            for entry in written:
+                tracker.mark(Path(entry).stem, "generated")
+            for entry in failed:
+                stem = Path(str(entry.get("file") or "")).stem
+                if stem:
+                    tracker.mark(stem, "failed", detail=str(entry.get("error") or "")[:120])
+        except Exception:
+            pass
+
+        settings = (context.metadata or {}).get("settings")
+        rendering = getattr(settings, "rendering", None)
+        if rendering is not None and bool(getattr(rendering, "auto_enqueue_renders", False)):
+            try:
+                from openharness.services.render_pipeline import get_render_pipeline
+
+                scene_paths = [Path(p) if Path(p).is_absolute() else context.cwd / p for p in written]
+                scene_paths = [p for p in scene_paths if p.is_file()]
+                if scene_paths:
+                    pipeline = get_render_pipeline(Path(context.cwd), settings)
+                    tier = "draft" if bool(getattr(rendering, "draft_first", True)) else "final"
+                    pipeline.submit_batch(
+                        scene_paths,
+                        engine=arguments.engine,
+                        tier=tier,
+                        respect_dependencies=bool(getattr(rendering, "dependency_graph", True)),
+                    )
+                    log.info(
+                        "auto-enqueued %d scene(s) at tier=%s (pipeline overlap #21)",
+                        len(scene_paths), tier,
+                    )
+            except Exception:
+                log.debug("render auto-enqueue skipped", exc_info=True)
+
+        try:
+            import asyncio
+
+            from openharness.services.asset_prefetch import AssetPrefetcher
+
+            scene_paths = [Path(p) if Path(p).is_absolute() else context.cwd / p for p in written]
+            scene_paths = [p for p in scene_paths if p.is_file()]
+            if scene_paths:
+                prefetcher = AssetPrefetcher()
+
+                async def _prefetch() -> None:
+                    try:
+                        await prefetcher.prefetch_scenes(
+                            scene_paths, cwd=Path(context.cwd), engine=arguments.engine
+                        )
+                    except Exception:
+                        pass  # prefetch is purely an optimization
+
+                asyncio.get_running_loop().create_task(_prefetch())
+        except Exception:
+            pass  # no running loop (sync caller) — skip prefetch
 
     async def _call_llm(
         self,

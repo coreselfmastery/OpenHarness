@@ -594,6 +594,149 @@ class VisionModelConfig(BaseModel):
         return bool(self.model and self.api_key)
 
 
+class InferenceSettings(BaseModel):
+    """Category 1: LLM inference speed features (items #1-#6, #18).
+
+    All features are opt-in except prefix caching, which is a pure win
+    when the provider supports it (Anthropic prompt caching) and a no-op
+    elsewhere.
+    """
+
+    # #2 — add Anthropic ``cache_control`` breakpoints on the system
+    # prompt + tool list so repeated prefill hits the provider cache
+    # (30-50% cheaper/faster prefill on Anthropic; automatic and free on
+    # OpenAI/Groq so the flag is harmless there).
+    prefix_caching: bool = True
+    # #3 — strip redundant content (old tool-output bodies, repeated
+    # whitespace) from requests above ``min_chars``.
+    prompt_compression: bool = False
+    prompt_compression_min_chars: int = 6000
+    prompt_compression_keep_turns: int = 3
+    # #18 — semantic (MinHash/Jaccard) response cache with SQLite persistence.
+    semantic_cache: bool = False
+    semantic_cache_threshold: float = 0.88
+    semantic_cache_max_entries: int = 512
+    # #4 — race 2-3 providers concurrently, keep the first response.
+    # Doubles token cost on raced calls, so it stays opt-in.
+    cross_provider_racing: bool = False
+    # #6 — rotate a pool of API keys on rate limits (env:
+    # OPENHARNESS_API_KEY_POOL, comma-separated; Groq: OPENHARNESS_GROQ_API_KEYS).
+    api_key_pool: list[str] = Field(default_factory=list)
+    # #1/#5 — speculative decoding / multi-token prediction are model
+    # server features (Groq does speculation natively; vLLM needs server
+    # flags — see the ``server_config`` tool). When True, the client
+    # probes the endpoint and reports capability honestly instead of
+    # pretending to accelerate anything.
+    speculative_reporting: bool = True
+
+
+class RenderSettings(BaseModel):
+    """Category 3+5: rendering speed and pipeline overlap (items #11-#16, #21, #24-#25, #40)."""
+
+    # #11 — parallel scene rendering across N workers.
+    parallel_rendering: bool = True
+    # None = auto from GPU count (kaggle_env), 1 when no GPU is present.
+    render_workers: int | None = None
+    # #12/#16 — render a cheap draft first, QA it, only render the
+    # full-quality version for approved scenes.
+    draft_first: bool = True
+    resolution_tiers: dict[str, str] = Field(
+        default_factory=lambda: {"draft": "640x360", "review": "1280x720", "final": "1920x1080"}
+    )
+    # #13 — promote a passing draft (skip the full render) when its
+    # quality gate score clears this threshold (0.0-1.0).
+    quality_early_exit: bool = True
+    early_exit_score_threshold: float = 0.9
+    # #14/#17 — fingerprint-based render cache (scene code + assets +
+    # engine args + tier). Persisted across sessions.
+    render_cache: bool = True
+    # #15 — prefer NVENC (h264_nvenc) when a supported GPU is present,
+    # verified with a real probe encode; fall back to libx264.
+    nvenc: bool = True
+    # #21 — batch_scene auto-enqueues renders while generation continues.
+    auto_enqueue_renders: bool = False
+    # #25 — honor ``depends_on`` scene ordering; render independent
+    # scenes in parallel waves.
+    dependency_graph: bool = True
+    # #24 — idle render workers steal queued work from busy workers.
+    work_stealing: bool = True
+    # Per-render-job hard timeout (#27 render stage).
+    render_timeout_seconds: int = 1800
+
+
+class QASettings(BaseModel):
+    """Category 2: parallel QA (items #7-#10)."""
+
+    # #7 — review scenes with parallel QA calls (wave size caps fan-out).
+    parallel_waves: bool = True
+    wave_size: int = 5
+    # #8 — batch several scenes per QA call when they are simple.
+    review_batching: bool = True
+    review_batch_size: int = 5
+    # #9 — lightweight checklist for simple scenes, deep review for complex.
+    smart_depth: bool = True
+    # #10 — predict likely failure categories from persisted stats and
+    # pre-emptively check them.
+    failure_prediction: bool = True
+    # QA model config (falls back to scene_gen config when empty).
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    max_tokens: int = 8192
+
+
+class ControlSettings(BaseModel):
+    """Category 6: control & safety (items #26-#40).
+
+    ``enabled`` gates the invasive pieces (kill switch checks in the
+    query loop, watchdog, pause gates). Audit logging and checkpoints
+    are cheap and on by default.
+    """
+
+    enabled: bool = True
+    # #26
+    kill_switch: bool = True
+    # #30
+    pause_resume: bool = True
+    # #36 — no progress for this many seconds -> trip the kill switch.
+    watchdog_timeout_seconds: int = 900
+    # #34 — detect stuck agents (semaphore fully held + no completions).
+    deadlock_detection: bool = True
+    deadlock_probe_seconds: int = 180
+    # #29 — append-only JSONL audit log of every tool/LLM/render/QA action.
+    audit_log: bool = True
+    # #27 — per-stage wall-clock limits.
+    stage_time_limits: bool = True
+    llm_call_timeout_seconds: int = 600
+    tool_timeout_seconds: int = 900
+    # #28 — cost alerts at warning/halt ratios of the session budget.
+    cost_alerts: bool = True
+    cost_budget_usd: float | None = None
+    cost_warn_ratio: float = 0.8
+    # #37 — auto-checkpoint every N turns.
+    checkpoints: bool = True
+    checkpoint_interval_turns: int = 10
+    # #31 — cross-agent file locking on write/edit.
+    file_locking: bool = True
+    file_lock_timeout_seconds: int = 30
+    # #33 — validate + repair session state before resume.
+    state_validation: bool = True
+    # #32 — finish in-flight work before the process dies.
+    graceful_shutdown: bool = True
+
+
+class ModelCacheSettings(BaseModel):
+    """#20 — disk-based model cache for HuggingFace downloads.
+
+    Redirects HF_HOME / HF_HUB_CACHE to a persistent directory so a
+    restarted session verifies existing weights instead of re-downloading
+    them (5-10 minutes saved per session when the directory persists).
+    """
+
+    enabled: bool = False
+    cache_dir: str = ""
+
+
 class Settings(BaseModel):
     """Main settings model for OpenHarness."""
 
@@ -669,6 +812,13 @@ class Settings(BaseModel):
         default_factory=lambda: ["BRIEF.md", "STORYBOARD.md", "STYLE.md"]
     )
     provider_routing: dict[str, Any] | None = None
+
+    # --- Waves 2-6 performance/safety feature settings (items #1-#40) ---
+    inference: InferenceSettings = Field(default_factory=InferenceSettings)
+    rendering: RenderSettings = Field(default_factory=RenderSettings)
+    qa: QASettings = Field(default_factory=QASettings)
+    control: ControlSettings = Field(default_factory=ControlSettings)
+    model_cache: ModelCacheSettings = Field(default_factory=ModelCacheSettings)
 
     # Vision model (image-to-text fallback)
     vision: VisionModelConfig = Field(default_factory=VisionModelConfig)
@@ -993,6 +1143,10 @@ class Settings(BaseModel):
         return merged.sync_active_profile_from_flat_fields().materialize_active_profile()
 
 
+class _CsvList:
+    """Sentinel type marking comma-separated list env overrides."""
+
+
 def _apply_env_overrides(settings: Settings) -> Settings:
     """Apply supported environment variable overrides over loaded settings.
 
@@ -1170,6 +1324,111 @@ def _apply_env_overrides(settings: Settings) -> Settings:
     auto_context_env = os.environ.get("OPENHARNESS_AUTO_CONTEXT_INJECT")
     if auto_context_env is not None:
         updates["auto_context_inject"] = _parse_bool_env(auto_context_env)
+
+    # --- Waves 2-6 feature overrides (items #1-#40) ---
+    def _nested(namespace: str, model_cls, env_map: dict[str, tuple[str, Any]]) -> None:
+        """Collect env overrides for a nested settings model.
+
+        ``env_map`` maps ENV_VAR -> (field, parser). Only present env vars
+        are applied, over a copy of the current nested model.
+        """
+        nested_updates: dict[str, Any] = {}
+        for env_var, (field_name, parser) in env_map.items():
+            raw = os.environ.get(env_var)
+            if raw is None:
+                continue
+            if parser is bool:
+                nested_updates[field_name] = _parse_bool_env(raw)
+            elif parser is int:
+                try:
+                    nested_updates[field_name] = int(raw)
+                except ValueError:
+                    continue
+            elif parser is float:
+                try:
+                    nested_updates[field_name] = float(raw)
+                except ValueError:
+                    continue
+            elif isinstance(parser, _CsvList):
+                nested_updates[field_name] = [p.strip() for p in raw.split(",") if p.strip()]
+            else:
+                nested_updates[field_name] = raw.strip()
+        if nested_updates:
+            current = getattr(settings, namespace, None)
+            base = current.model_copy() if current is not None else model_cls()
+            updates[namespace] = base.model_copy(update=nested_updates)
+
+    _nested(
+        "inference",
+        InferenceSettings,
+        {
+            "OPENHARNESS_PREFIX_CACHING": ("prefix_caching", bool),
+            "OPENHARNESS_PROMPT_COMPRESSION": ("prompt_compression", bool),
+            "OPENHARNESS_PROMPT_COMPRESSION_MIN_CHARS": ("prompt_compression_min_chars", int),
+            "OPENHARNESS_SEMANTIC_CACHE": ("semantic_cache", bool),
+            "OPENHARNESS_SEMANTIC_CACHE_THRESHOLD": ("semantic_cache_threshold", float),
+            "OPENHARNESS_CROSS_PROVIDER_RACING": ("cross_provider_racing", bool),
+            "OPENHARNESS_API_KEY_POOL": ("api_key_pool", _CsvList()),
+        },
+    )
+    _nested(
+        "rendering",
+        RenderSettings,
+        {
+            "OPENHARNESS_PARALLEL_RENDERING": ("parallel_rendering", bool),
+            "OPENHARNESS_RENDER_WORKERS": ("render_workers", int),
+            "OPENHARNESS_DRAFT_FIRST": ("draft_first", bool),
+            "OPENHARNESS_RENDER_CACHE": ("render_cache", bool),
+            "OPENHARNESS_NVENC": ("nvenc", bool),
+            "OPENHARNESS_AUTO_ENQUEUE_RENDERS": ("auto_enqueue_renders", bool),
+            "OPENHARNESS_RENDER_TIMEOUT_SECONDS": ("render_timeout_seconds", int),
+        },
+    )
+    _nested(
+        "qa",
+        QASettings,
+        {
+            "OPENHARNESS_QA_PARALLEL": ("parallel_waves", bool),
+            "OPENHARNESS_QA_WAVE_SIZE": ("wave_size", int),
+            "OPENHARNESS_QA_BATCHING": ("review_batching", bool),
+            "OPENHARNESS_QA_MODEL": ("model", str),
+            "OPENHARNESS_QA_API_KEY": ("api_key", str),
+            "OPENHARNESS_QA_BASE_URL": ("base_url", str),
+        },
+    )
+    _nested(
+        "control",
+        ControlSettings,
+        {
+            "OPENHARNESS_CONTROL": ("enabled", bool),
+            "OPENHARNESS_KILL_SWITCH": ("kill_switch", bool),
+            "OPENHARNESS_WATCHDOG_TIMEOUT_SECONDS": ("watchdog_timeout_seconds", int),
+            "OPENHARNESS_AUDIT_LOG": ("audit_log", bool),
+            "OPENHARNESS_TOOL_TIMEOUT_SECONDS": ("tool_timeout_seconds", int),
+            "OPENHARNESS_LLM_CALL_TIMEOUT_SECONDS": ("llm_call_timeout_seconds", int),
+            "OPENHARNESS_COST_BUDGET_USD": ("cost_budget_usd", float),
+            "OPENHARNESS_COST_ALERTS": ("cost_alerts", bool),
+            "OPENHARNESS_CHECKPOINT_INTERVAL_TURNS": ("checkpoint_interval_turns", int),
+            "OPENHARNESS_FILE_LOCKING": ("file_locking", bool),
+            "OPENHARNESS_FILE_LOCK_TIMEOUT_SECONDS": ("file_lock_timeout_seconds", int),
+        },
+    )
+    _nested(
+        "model_cache",
+        ModelCacheSettings,
+        {
+            "OPENHARNESS_MODEL_CACHE": ("enabled", bool),
+            "OPENHARNESS_MODEL_CACHE_DIR": ("cache_dir", str),
+        },
+    )
+    # Groq key pool: dedicated alias so users can keep provider-specific
+    # pools separate from the generic one.
+    groq_keys = os.environ.get("OPENHARNESS_GROQ_API_KEYS", "").strip()
+    if groq_keys:
+        pool = [k.strip() for k in groq_keys.split(",") if k.strip()]
+        current = getattr(settings, "inference", None)
+        base = current.model_copy() if current is not None else InferenceSettings()
+        updates["inference"] = base.model_copy(update={"api_key_pool": pool})
 
     if not updates:
         return settings

@@ -39,6 +39,8 @@ class QueryEngine:
         hook_executor: HookExecutor | None = None,
         tool_metadata: dict[str, object] | None = None,
         settings: Settings | None = None,
+        control_bus: object | None = None,
+        session_cost_tracker: object | None = None,
     ) -> None:
         self._api_client = api_client
         self._tool_registry = tool_registry
@@ -65,6 +67,25 @@ class QueryEngine:
         self._settings = settings
         self._messages: list[ConversationMessage] = []
         self._cost_tracker = CostTracker()
+        # Waves 2-6 control plane (#26-#40): the shared control bus (kill
+        # switch / pause gate / watchdog / injected messages) and the
+        # session cost tracker (#28). Both optional — engine behavior is
+        # identical to before when they are None.
+        self._control_bus = control_bus
+        self._session_cost_tracker = session_cost_tracker
+        self._tool_timeout_seconds = 0.0
+        self._checkpoint_interval_turns = 0
+        if settings is not None:
+            control = getattr(settings, "control", None)
+            if control is not None and bool(getattr(control, "enabled", False)):
+                if bool(getattr(control, "stage_time_limits", True)):
+                    self._tool_timeout_seconds = float(
+                        getattr(control, "tool_timeout_seconds", 900) or 0
+                    )
+                if bool(getattr(control, "checkpoints", True)):
+                    self._checkpoint_interval_turns = max(
+                        0, int(getattr(control, "checkpoint_interval_turns", 10) or 0)
+                    )
         # Optimization #7 + #10: count user turns so we only auto-save
         # every ``auto_save_interval`` turns (default 10). Saving on
         # every turn is too aggressive for long video-generation runs.
@@ -78,6 +99,24 @@ class QueryEngine:
     def messages(self) -> list[ConversationMessage]:
         """Return the current conversation history."""
         return list(self._messages)
+
+    @property
+    def live_messages(self) -> list[ConversationMessage]:
+        """Return the ACTUAL internal message list (not a copy).
+
+        Used by the checkpoint tool (#37) to snapshot the conversation
+        without copying on every read. Callers must not mutate; use
+        :meth:`rollback_messages` for that.
+        """
+        return self._messages
+
+    def rollback_messages(self, messages: list[ConversationMessage]) -> None:
+        """Replace the conversation history in place (#37 rollback).
+
+        The internal list object is mutated (not rebound) so any
+        references held by the query loop stay valid.
+        """
+        self._messages[:] = list(messages)
 
     @property
     def cwd(self) -> Path:
@@ -282,6 +321,10 @@ class QueryEngine:
             ask_user_prompt=self._ask_user_prompt,
             hook_executor=self._hook_executor,
             tool_metadata=self._tool_metadata,
+            control_bus=self._control_bus,
+            session_cost_tracker=self._session_cost_tracker,
+            tool_timeout_seconds=self._tool_timeout_seconds,
+            checkpoint_interval_turns=self._checkpoint_interval_turns,
         )
         query_messages = list(self._messages)
         coordinator_context = self._build_coordinator_context_message()
@@ -356,6 +399,10 @@ class QueryEngine:
             ask_user_prompt=self._ask_user_prompt,
             hook_executor=self._hook_executor,
             tool_metadata=self._tool_metadata,
+            control_bus=self._control_bus,
+            session_cost_tracker=self._session_cost_tracker,
+            tool_timeout_seconds=self._tool_timeout_seconds,
+            checkpoint_interval_turns=self._checkpoint_interval_turns,
         )
         async for event, usage in run_query(context, self._messages):
             if usage is not None:

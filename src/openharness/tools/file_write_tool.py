@@ -41,6 +41,22 @@ class FileWriteTool(BaseTool):
             if not allowed:
                 return ToolResult(output=f"Sandbox: {reason}", is_error=True)
 
+        # Item #31: cross-agent file locking. Hold the lock for the whole
+        # read-modify-write so a concurrent agent cannot interleave.
+        from openharness.services.conflict_resolution import FileConflictError
+
+        try:
+            async with _path_lock(context, path):
+                return await self._execute_locked(arguments, context, path)
+        except FileConflictError as exc:
+            return ToolResult(output=f"Write blocked: {exc}", is_error=True)
+
+    async def _execute_locked(
+        self,
+        arguments: FileWriteToolInput,
+        context: ToolExecutionContext,
+        path: Path,
+    ) -> ToolResult:
         approval_prompt = context.metadata.get("edit_approval_prompt") if context.metadata else None
         if approval_prompt is not None:
             original = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -58,6 +74,34 @@ class FileWriteTool(BaseTool):
             path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(arguments.content, encoding="utf-8")
         return ToolResult(output=f"Wrote {path}")
+
+
+def _path_lock(context: ToolExecutionContext, path: Path):
+    """Return the cross-agent lock context for ``path`` when enabled (#31).
+
+    Returns either the real async lock context or a ``nullcontext`` (which
+    supports ``async with`` on Python >= 3.10) when locking is disabled or
+    the conflict-resolution module is unavailable.
+    """
+    from contextlib import nullcontext
+
+    settings = (context.metadata or {}).get("settings")
+    try:
+        from openharness.services.conflict_resolution import (
+            acquire_path_lock,
+            configure_file_locking_from_settings,
+            lock_timeout_from_settings,
+        )
+
+        if not configure_file_locking_from_settings(settings):
+            return nullcontext()
+        return acquire_path_lock(
+            path,
+            timeout_seconds=lock_timeout_from_settings(settings),
+            holder_label="openharness write_file",
+        )
+    except Exception:
+        return nullcontext()
 
 
 def _resolve_path(base: Path, candidate: str) -> Path:

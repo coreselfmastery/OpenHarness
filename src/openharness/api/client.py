@@ -48,6 +48,12 @@ class ApiMessageRequest:
     effort: str | None = None
     # Optimization #9: per-call reasoning budget for thinking models.
     thinking_budget: int | None = None
+    # Item #2 (prefix caching): when True, Anthropic-format requests add
+    # ``cache_control`` breakpoints on the system prompt and the tool
+    # list so repeated prefills hit the provider KV cache (30-50% cheaper
+    # and faster prefill). OpenAI-format clients ignore this flag — those
+    # providers cache prefixes server-side automatically.
+    prefix_caching: bool = False
 
 
 @dataclass(frozen=True)
@@ -218,8 +224,32 @@ class AnthropicApiClient:
                 if params.get("system")
                 else attribution
             )
+        # Item #2 — Anthropic prompt caching. Convert the plain string
+        # system prompt into a block list whose final block carries an
+        # ``ephemeral`` cache breakpoint. The provider then serves cached
+        # prefill tokens on subsequent turns (reported back through
+        # ``usage.cache_read_input_tokens``).
+        if request.prefix_caching and params.get("system"):
+            params["system"] = [
+                {
+                    "type": "text",
+                    "text": params["system"],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if request.tools:
             params["tools"] = request.tools
+            # Item #2 (cont.): the tool schema list is also stable across
+            # turns, so the last tool definition gets the second (and,
+            # per Anthropic limits, final) cache breakpoint. Tools are
+            # emitted before messages in the request, so this caches the
+            # full system + tools prefix.
+            if request.prefix_caching:
+                tools_copy = [dict(tool) for tool in params["tools"]]
+                last = dict(tools_copy[-1])
+                last["cache_control"] = {"type": "ephemeral"}
+                tools_copy[-1] = last
+                params["tools"] = tools_copy
         # Optimization #9: forward thinking_budget to Anthropic.
         # Claude 3.5+ supports extended thinking via a ``thinking`` field
         # carrying ``{"type": "enabled", "budget_tokens": N}``. We map
@@ -282,6 +312,10 @@ class AnthropicApiClient:
             usage=UsageSnapshot(
                 input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
                 output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                cache_write_tokens=int(
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0
+                ),
+                cache_read_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
             ),
             stop_reason=getattr(final_message, "stop_reason", None),
         )

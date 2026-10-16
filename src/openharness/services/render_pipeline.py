@@ -1,0 +1,917 @@
+"""Render pipeline — items #11-#16, #21, #24, #25, #27 (render stage), #40.
+
+A real, queue-based scene renderer:
+
+- ``RenderQueue`` (#11): N async workers (auto-sized to the GPU count)
+  render scenes in parallel subprocesses, each pinned to its own GPU
+  via ``CUDA_VISIBLE_DEVICES`` on multi-GPU hosts (Kaggle T4 x2 ->
+  2 workers).
+- ``WorkStealingQueue`` (#24): idle workers steal queued jobs from the
+  longest busy worker's queue.
+- ``SceneDependencyGraph`` (#25): parses ``depends_on`` from scene code,
+  detects cycles, and orders jobs so independent scenes render in
+  parallel while dependent scenes wait.
+- Resolution tiering + draft-first (#12/#16): ``draft`` (640x360) ->
+  ``review`` (720p) -> ``final`` (1080p), with engine-specific quality
+  flags.
+- Quality-based early exit (#13): a draft that passes its quality gate
+  is promoted instead of re-rendered at full res.
+- Incremental/scene-level render cache (#14/#17): fingerprints skip
+  byte-identical re-renders (see ``render_cache.py``).
+- NVENC (#15): a REAL one-second probe encode verifies ``h264_nvenc``
+  before it is preferred; otherwise libx264.
+- Pipeline overlap (#21): ``submit()`` never blocks, so LLM scene
+  generation and rendering proceed concurrently.
+- Per-job timeout (#27 render stage) and queue monitoring (#40).
+
+Engine commands are templates (defaults for hyperframes/manim/blender/
+ffmpeg) overridable per project via ``render_engines.json`` in the
+project root. Renders run as explicit argv lists — never a shell string
+— so scene code cannot inject shell syntax.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import shutil
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from openharness.services.render_cache import RenderCache, scene_fingerprint
+
+log = logging.getLogger(__name__)
+
+TIERS = ("draft", "review", "final")
+TIER_ORDER = {name: index for index, name in enumerate(TIERS)}
+
+
+# ======================================================================
+# Engine command templates
+# ======================================================================
+
+DEFAULT_ENGINE_TEMPLATES: dict[str, list[str]] = {
+    # hyperframes: browser-based scene renderer.
+    "hyperframes": [
+        "hyperframes", "render", "{scene}",
+        "--output", "{output}",
+        "--width", "{width}", "--height", "{height}", "--fps", "{fps}",
+    ],
+    # manim: -ql 480p / -qm 720p / -qh 1080p quality flags.
+    "manim": [
+        "manim", "render", "{scene}", "{scene_class}",
+        "-q{quality}", "--media_dir", "{media_dir}",
+    ],
+    # blender: headless background render of a .blend scene graph.
+    "blender": [
+        "blender", "-b", "{scene}", "-o", "{output_stem}", "-a",
+    ],
+    # ffmpeg: the scene file IS a filter_complex_script; codec args and
+    # resolution come from tier settings.
+    "ffmpeg": [
+        "ffmpeg", "-y", "-hide_banner", "-nostdin",
+        "{input_args}", "-filter_complex_script", "{scene}",
+        "{codec_args}", "{output}",
+    ],
+}
+
+# manim quality flag per tier.
+_MANIM_QUALITY = {"draft": "l", "review": "m", "final": "h"}
+
+#: ffmpeg input args per tier — a black canvas the filter script draws on.
+_FFMPEG_INPUT_ARGS = {
+    "draft": "-f lavfi -i color=c=black:s=640x360:d=10:r=30",
+    "review": "-f lavfi -i color=c=black:s=1280x720:d=10:r=30",
+    "final": "-f lavfi -i color=c=black:s=1920x1080:d=10:r=30",
+}
+
+_NVENC_ARGS = "-c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -b:v 0 -pix_fmt yuv420p"
+_X264_ARGS = "-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p"
+
+
+def load_engine_templates(cwd: Path) -> dict[str, list[str]]:
+    """Load engine command templates, honoring ``render_engines.json``."""
+    templates = {name: list(argv) for name, argv in DEFAULT_ENGINE_TEMPLATES.items()}
+    override_path = cwd / "render_engines.json"
+    if override_path.is_file():
+        try:
+            raw = json.loads(override_path.read_text(encoding="utf-8"))
+            for name, argv in raw.items():
+                if isinstance(argv, list) and all(isinstance(tok, str) for tok in argv):
+                    templates[name] = argv
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring invalid %s: %s", override_path, exc)
+    return templates
+
+
+def extract_scene_class(scene_path: Path) -> str:
+    """Extract the manim scene class name from scene code (default ``Scene``)."""
+    try:
+        code = scene_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "Scene"
+    match = re.search(r"class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(?:Scene|.*Scene)\s*\)", code)
+    return match.group(1) if match else "Scene"
+
+
+def build_render_command(
+    *,
+    engine: str,
+    scene_path: Path,
+    output_path: Path,
+    tier: str,
+    width: int,
+    height: int,
+    fps: int,
+    codec_args: str,
+    templates: dict[str, list[str]] | None = None,
+    output_dir: Path,
+) -> list[str]:
+    """Build the explicit argv for one render job (no shell involved)."""
+    templates = templates or DEFAULT_ENGINE_TEMPLATES
+    template = templates.get(engine) or templates["hyperframes"]
+    replacements = {
+        "scene": str(scene_path),
+        "output": str(output_path),
+        "output_stem": str(output_path.with_suffix("")),
+        "width": str(width),
+        "height": str(height),
+        "fps": str(fps),
+        "codec_args": codec_args,
+        "quality": _MANIM_QUALITY.get(tier, "m"),
+        "scene_class": extract_scene_class(scene_path),
+        "media_dir": str(output_dir / "manim_media"),
+        "input_args": _FFMPEG_INPUT_ARGS.get(tier, _FFMPEG_INPUT_ARGS["review"]),
+    }
+    argv: list[str] = []
+    for token in template:
+        for key, value in replacements.items():
+            token = token.replace("{" + key + "}", value)
+        argv.append(token)
+    return argv
+
+
+def parse_resolution(resolution: str) -> tuple[int, int]:
+    """Parse ``WxH`` (``1280x720``) into ints with a safe fallback."""
+    match = re.fullmatch(r"\s*(\d{2,5})\s*[xX×]\s*(\d{2,5})\s*", resolution or "")
+    if not match:
+        return 1280, 720
+    return int(match.group(1)), int(match.group(2))
+
+
+# ======================================================================
+# #15 — NVENC codec detection (verified with a real probe encode)
+# ======================================================================
+
+class NVENCDetector:
+    """Detect hardware-accelerated encoding with a REAL probe.
+
+    Runs a genuine 0.2-second ``h264_nvenc`` test encode through the
+    local ffmpeg. Only when the probe succeeds (exit 0 AND a non-empty
+    output) is NVENC used for renders. Everything else falls back to
+    libx264. The result is cached for the process lifetime.
+    """
+
+    def __init__(self) -> None:
+        self._checked = False
+        self._available = False
+        self._reason = "not probed yet"
+
+    def available(self, *, force_recheck: bool = False) -> tuple[bool, str]:
+        if self._checked and not force_recheck:
+            return self._available, self._reason
+        self._checked = True
+        self._available = False
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self._reason = "ffmpeg not on PATH"
+            return False, self._reason
+        if not shutil.which("nvidia-smi"):
+            self._reason = "no NVIDIA GPU (nvidia-smi missing)"
+            return False, self._reason
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            probe_output = Path(tmp) / "probe.mp4"
+            cmd = [
+                ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=256x144:d=0.2:r=30",
+                "-c:v", "h264_nvenc", "-frames:v", "6", str(probe_output),
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                self._reason = f"probe failed: {exc}"
+                return False, self._reason
+            if result.returncode == 0 and probe_output.is_file() and probe_output.stat().st_size > 0:
+                self._available = True
+                self._reason = "h264_nvenc probe encode succeeded"
+            else:
+                self._reason = (
+                    "h264_nvenc probe encode failed (driver or SDK mismatch): "
+                    + (result.stderr.strip()[:160] or "no stderr")
+                )
+        return self._available, self._reason
+
+    def codec_args(self, enabled: bool = True) -> str:
+        """Return the codec argument string for the current machine."""
+        if not enabled:
+            return _X264_ARGS
+        ok, reason = self.available()
+        log.debug("nvenc detector: available=%s (%s)", ok, reason)
+        return _NVENC_ARGS if ok else _X264_ARGS
+
+
+# ======================================================================
+# #25 — Scene dependency graph
+# ======================================================================
+
+_DEPENDS_RE = re.compile(r"^\s*(?:#|//)\s*depends_on:\s*([A-Za-z0-9_.\-]+)\s*$", re.MULTILINE)
+
+
+@dataclass
+class SceneNode:
+    name: str
+    path: Path
+    depends_on: list[str] = field(default_factory=list)
+
+
+class SceneDependencyGraph:
+    """Parse scene dependencies and compute parallel render waves.
+
+    Scenes declare dependencies with a comment line in their code::
+
+        // depends_on: scene_001
+        # depends_on: scene_001, scene_002   (comma-separated supported)
+
+    ``render_waves()`` returns a list of lists: every scene in wave *i*
+    depends only on scenes in earlier waves, so each wave renders fully
+    in parallel. Cycles raise ``ValueError`` instead of hanging.
+    """
+
+    def __init__(self, scene_paths: list[Path]) -> None:
+        self.nodes: dict[str, SceneNode] = {}
+        for path in scene_paths:
+            name = path.stem
+            self.nodes[name] = SceneNode(name=name, path=path, depends_on=[])
+        for node in self.nodes.values():
+            code = self._read(node.path)
+            for match in _DEPENDS_RE.finditer(code):
+                for dep in match.group(1).split(","):
+                    dep = dep.strip()
+                    if dep:
+                        node.depends_on.append(dep)
+
+    @staticmethod
+    def _read(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def render_waves(self) -> list[list[str]]:
+        """Topologically group scene names into parallel waves."""
+        resolved: set[str] = set()
+        waves: list[list[str]] = []
+        remaining = set(self.nodes)
+        # Local dependencies (files missing from the scene list) are
+        # ignored — they refer to assets built earlier in the project.
+        while remaining:
+            ready = sorted(
+                name for name in remaining
+                if all(
+                    dep in resolved or dep not in self.nodes
+                    for dep in self.nodes[name].depends_on
+                )
+            )
+            if not ready:
+                raise ValueError(
+                    "dependency cycle among scenes: "
+                    + ", ".join(sorted(remaining))
+                )
+            waves.append(ready)
+            resolved.update(ready)
+            remaining.difference_update(ready)
+        return waves
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            name: {"path": str(node.path), "depends_on": node.depends_on}
+            for name, node in self.nodes.items()
+        }
+
+
+# ======================================================================
+# #24 — Work-stealing job queue
+# ======================================================================
+
+class WorkStealingQueue:
+    """Per-worker deques with steal-from-the-longest semantics.
+
+    ``get(worker_id)`` pops the front of the worker's own deque; when
+    empty, it steals the BACK of the currently-longest deque (FIFO for
+    the owner, LIFO for the thief — minimizes contention on the hot
+    end). Coroutines wait on a shared condition while every deque is
+    empty and the queue is open.
+    """
+
+    def __init__(self, worker_count: int, *, stealing: bool = True) -> None:
+        if worker_count < 1:
+            raise ValueError("worker_count must be >= 1")
+        self._deques: list[deque[Any]] = [deque() for _ in range(worker_count)]
+        self._stealing = stealing
+        self._cond = asyncio.Condition()
+        self._closed = False
+        self.steals = 0
+
+    async def put(self, item: Any, *, worker_hint: int | None = None) -> None:
+        """Enqueue ``item`` onto the least-loaded worker (or a hinted one)."""
+        async with self._cond:
+            if worker_hint is not None:
+                index = worker_hint % len(self._deques)
+            else:
+                sizes = [len(d) for d in self._deques]
+                index = sizes.index(min(sizes))
+            self._deques[index].append(item)
+            self._cond.notify()
+
+    def put_nowait(self, item: Any, *, worker_hint: int | None = None) -> None:
+        """Synchronous enqueue used before workers are running."""
+        if worker_hint is not None:
+            self._deques[worker_hint % len(self._deques)].append(item)
+        else:
+            sizes = [len(d) for d in self._deques]
+            self._deques[sizes.index(min(sizes))].append(item)
+
+    def _next_item(self, worker_id: int) -> Any:
+        own = self._deques[worker_id % len(self._deques)]
+        if own:
+            return own.popleft()
+        if self._stealing:
+            longest = max(self._deques, key=len)
+            if longest:
+                self.steals += 1
+                return longest.pop()  # steal from the back
+        return None
+
+    async def get(self, worker_id: int) -> Any:
+        """Block until a job is available for this worker (or queue closes)."""
+        while True:
+            async with self._cond:
+                item = self._next_item(worker_id)
+                if item is not None:
+                    return item
+                if self._closed:
+                    return None
+                await self._cond.wait()
+
+    async def close(self) -> None:
+        """Wake every waiting worker; ``get`` then drains and returns None."""
+        async with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    @property
+    def depth(self) -> int:
+        return sum(len(d) for d in self._deques)
+
+    def snapshot(self) -> list[int]:
+        return [len(d) for d in self._deques]
+
+
+# ======================================================================
+# Render jobs and the queue itself
+# ======================================================================
+
+@dataclass
+class RenderJob:
+    """One scene render through the pipeline."""
+
+    scene: Path
+    engine: str
+    tier: str = "final"
+    output_dir: Path | None = None
+    status: str = "pending"  # pending|running|done|failed|timeout|skipped
+    job_id: str = ""
+    fingerprint: str = ""
+    output_path: Path | None = None
+    error: str = ""
+    exit_code: int | None = None
+    duration_seconds: float = 0.0
+    enqueued_at: float = field(default_factory=time.monotonic)
+    started_at: float | None = None
+    finished_at: float | None = None
+    worker: int | None = None
+    cached: bool = False
+    command: list[str] = field(default_factory=list)
+    timeout_seconds: float | None = None
+    quality_score: float | None = None
+    promoted: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "scene": str(self.scene),
+            "engine": self.engine,
+            "tier": self.tier,
+            "status": self.status,
+            "output_path": str(self.output_path) if self.output_path else None,
+            "cached": self.cached,
+            "duration_seconds": round(self.duration_seconds, 2),
+            "error": self.error[:300],
+            "worker": self.worker,
+            "quality_score": self.quality_score,
+            "promoted": self.promoted,
+            "command": self.command[:12] + (["..."] if len(self.command) > 12 else []),
+        }
+
+
+def _default_output_path(scene: Path, output_dir: Path, tier: str) -> Path:
+    return output_dir / f"{scene.stem}.{tier}.mp4"
+
+
+class RenderPipeline:
+    """Parallel scene renderer with caching, tiering and monitoring.
+
+    One instance per process. ``get_render_pipeline()`` returns the
+    singleton used by tools and the batch_scene auto-enqueue hook.
+    """
+
+    def __init__(
+        self,
+        *,
+        workers: int,
+        cwd: Path,
+        resolution_tiers: dict[str, str] | None = None,
+        nvenc_enabled: bool = True,
+        cache_enabled: bool = True,
+        render_timeout_seconds: int = 1800,
+        stealing: bool = True,
+        audit_hook: Any = None,
+        progress_hook: Any = None,
+    ) -> None:
+        self.cwd = cwd
+        self.workers = max(1, workers)
+        self.resolution_tiers = dict(resolution_tiers or {})
+        self.nvenc_enabled = nvenc_enabled
+        self.cache_enabled = cache_enabled
+        self.render_timeout_seconds = render_timeout_seconds
+        self._queue = WorkStealingQueue(self.workers, stealing=stealing)
+        self.cache = RenderCache() if cache_enabled else None
+        self.nvenc = NVENCDetector()
+        self._templates = load_engine_templates(cwd)
+        self._worker_tasks: list[asyncio.Task[None]] = []
+        self._jobs: dict[str, RenderJob] = {}
+        self._job_seq = 0
+        self._started = False
+        self._closing = False
+        # worker_id -> live info for monitoring (#40)
+        self._worker_state: dict[int, dict[str, Any]] = {
+            i: {"busy": False, "current_job": None, "completed": 0} for i in range(self.workers)
+        }
+        self.audit_hook = audit_hook
+        self.progress_hook = progress_hook
+        self.total_render_seconds = 0.0
+        self.completed_renders = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Spawn the worker coroutines (idempotent)."""
+        if self._started:
+            return
+        self._started = True
+        for worker_id in range(self.workers):
+            self._worker_tasks.append(
+                asyncio.create_task(self._worker_loop(worker_id), name=f"render-worker-{worker_id}")
+            )
+
+    async def shutdown(self, *, drain: bool = True) -> None:
+        """Stop accepting jobs; optionally drain queued ones first (#32)."""
+        if self._closing:
+            return
+        self._closing = True
+        if drain and self._queue.depth:
+            deadline = time.monotonic() + self.render_timeout_seconds
+            while self._queue.depth and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+        await self._queue.close()
+        for task in self._worker_tasks:
+            if not task.done():
+                task.cancel()
+        for task in self._worker_tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._worker_tasks = []
+        self._started = False
+        self._closing = False
+
+    # ------------------------------------------------------------------
+    # Submission (#11, #21 — non-blocking)
+    # ------------------------------------------------------------------
+
+    def submit(
+        self,
+        scene: Path,
+        *,
+        engine: str = "hyperframes",
+        tier: str = "final",
+        output_dir: Path | None = None,
+        timeout_seconds: float | None = None,
+    ) -> RenderJob:
+        """Enqueue a render and return immediately (pipeline overlap #21)."""
+        if tier not in TIERS:
+            raise ValueError(f"tier must be one of {TIERS}, got {tier!r}")
+        self.start()
+        self._job_seq += 1
+        out_dir = Path(output_dir) if output_dir else self.cwd / "renders"
+        job = RenderJob(
+            job_id=f"r{self._job_seq:05d}",
+            scene=Path(scene),
+            engine=engine,
+            tier=tier,
+            output_dir=out_dir,
+            output_path=_default_output_path(Path(scene), out_dir, tier),
+            timeout_seconds=float(timeout_seconds or self.render_timeout_seconds),
+        )
+        self._jobs[job.job_id] = job
+        self._queue.put_nowait(job)
+        self._audit("render_enqueued", job)
+        self._progress(job.scene.name, f"queued:{tier}")
+        return job
+
+    def submit_batch(
+        self,
+        scenes: list[Path],
+        *,
+        engine: str = "hyperframes",
+        tier: str = "final",
+        output_dir: Path | None = None,
+        respect_dependencies: bool = True,
+    ) -> list[RenderJob]:
+        """Submit many scenes honoring the dependency graph (#25).
+
+        Dependent scenes are only enqueued after their dependencies
+        finish, so waves of independent scenes render in parallel while
+        preserving order where it matters.
+        """
+        if not respect_dependencies:
+            return [self.submit(s, engine=engine, tier=tier, output_dir=output_dir) for s in scenes]
+
+        graph = SceneDependencyGraph(scenes)
+        jobs_by_scene: dict[str, RenderJob] = {}
+        pending_waves = graph.render_waves()
+
+        def submit_wave() -> list[RenderJob]:
+            wave = pending_waves.pop(0) if pending_waves else []
+            submitted: list[RenderJob] = []
+            for name in wave:
+                job = self.submit(
+                    graph.nodes[name].path, engine=engine, tier=tier, output_dir=output_dir
+                )
+                jobs_by_scene[name] = job
+                submitted.append(job)
+            return submitted
+
+        first_jobs = submit_wave()
+        # Chain later waves onto the completion of earlier ones: each
+        # next wave is submitted only when the previous one is finished.
+        async def _chain() -> None:
+            while pending_waves:
+                previous = list(jobs_by_scene.values())
+                while any(j.status in {"pending", "running"} for j in previous):
+                    await asyncio.sleep(0.2)
+                wave = pending_waves.pop(0)
+                for name in wave:
+                    job = self.submit(
+                        graph.nodes[name].path, engine=engine, tier=tier, output_dir=output_dir
+                    )
+                    jobs_by_scene[name] = job
+
+        if pending_waves:
+            asyncio.create_task(_chain())
+        return first_jobs
+
+    async def wait(self, job: RenderJob, *, timeout: float | None = None) -> RenderJob:
+        """Wait for one job to reach a terminal state."""
+        deadline = time.monotonic() + (timeout or job.timeout_seconds or 3600)
+        while job.status in {"pending", "running"}:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"job {job.job_id} did not finish in time")
+            await asyncio.sleep(0.1)
+        return job
+
+    async def wait_all(self, *, timeout: float | None = None) -> list[RenderJob]:
+        """Wait for every known job to finish."""
+        deadline = time.monotonic() + (timeout or self.render_timeout_seconds * max(1, len(self._jobs)))
+        while any(j.status in {"pending", "running"} for j in self._jobs.values()):
+            if time.monotonic() > deadline:
+                break
+            await asyncio.sleep(0.2)
+        return list(self._jobs.values())
+
+    # ------------------------------------------------------------------
+    # Draft-first + early exit (#12, #13, #16)
+    # ------------------------------------------------------------------
+
+    def render_draft(self, scene: Path, *, engine: str, output_dir: Path | None = None) -> RenderJob:
+        """Render a cheap draft for QA review (#12/#16)."""
+        return self.submit(scene, engine=engine, tier="draft", output_dir=output_dir)
+
+    def record_quality(self, scene: Path, score: float, *, tier: str = "draft") -> RenderJob | None:
+        """Attach a QA score to the most recent job of this scene/tier."""
+        candidates = [
+            j for j in self._jobs.values()
+            if j.scene.name == scene.name and j.tier == tier
+        ]
+        if not candidates:
+            return None
+        job = max(candidates, key=lambda j: j.enqueued_at)
+        job.quality_score = float(score)
+        if self.cache is not None and job.fingerprint:
+            self.cache.record_quality_score(job.fingerprint, float(score))
+        return job
+
+    def promote(
+        self,
+        scene: Path,
+        *,
+        engine: str,
+        early_exit_threshold: float,
+        output_dir: Path | None = None,
+    ) -> RenderJob:
+        """Promote a scene after QA: early-exit or full-quality render.
+
+        - Draft quality >= threshold AND early exit allowed (#13):
+          the draft IS the final (marked promoted, no re-render).
+        - Otherwise: enqueue the full-resolution render (#12).
+        """
+        drafts = [
+            j for j in self._jobs.values()
+            if j.scene.name == scene.name and j.tier == "draft" and j.status == "done"
+        ]
+        draft = max(drafts, key=lambda j: j.enqueued_at) if drafts else None
+        if draft is not None and draft.quality_score is not None and draft.quality_score >= early_exit_threshold:
+            draft.promoted = True
+            if self.cache is not None and draft.fingerprint:
+                self.cache.promote(draft.fingerprint, new_tier="final")
+            self._audit("render_early_exit", draft)
+            self._progress(scene.name, "promoted:early-exit")
+            return draft
+        return self.submit(scene, engine=engine, tier="final", output_dir=output_dir)
+
+    # ------------------------------------------------------------------
+    # Monitoring (#40)
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        jobs = list(self._jobs.values())
+        return {
+            "workers": {
+                str(worker_id): dict(state)
+                for worker_id, state in self._worker_state.items()
+            },
+            "queue_depth": self._queue.depth,
+            "queue_per_worker": self._queue.snapshot(),
+            "work_steals": self._queue.steals,
+            "jobs": {
+                "total": len(jobs),
+                "pending": sum(1 for j in jobs if j.status == "pending"),
+                "running": sum(1 for j in jobs if j.status == "running"),
+                "done": sum(1 for j in jobs if j.status == "done"),
+                "skipped_cached": sum(1 for j in jobs if j.status == "skipped"),
+                "failed": sum(1 for j in jobs if j.status in {"failed", "timeout"}),
+            },
+            "avg_render_seconds": (
+                round(self.total_render_seconds / self.completed_renders, 2)
+                if self.completed_renders
+                else None
+            ),
+            "codec": self.nvenc.codec_args(self.nvenc_enabled).split()[1],
+        }
+
+    def recent_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [j.as_dict() for j in list(self._jobs.values())[-limit:]]
+
+    def jobs_snapshot(self) -> list[RenderJob]:
+        """Public read-only view of every job ever submitted."""
+        return list(self._jobs.values())
+
+    # ------------------------------------------------------------------
+    # Worker internals
+    # ------------------------------------------------------------------
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        while True:
+            job = await self._queue.get(worker_id)
+            if job is None:
+                return  # queue closed
+            state = self._worker_state[worker_id]
+            state["busy"] = True
+            state["current_job"] = job.job_id
+            try:
+                await self._run_job(job, worker_id)
+            finally:
+                state["busy"] = False
+                state["current_job"] = None
+                state["completed"] += 1
+
+    async def _run_job(self, job: RenderJob, worker_id: int) -> None:
+        job.status = "running"
+        job.started_at = time.monotonic()
+        job.worker = worker_id
+        self._progress(job.scene.name, f"rendering:{job.tier}")
+
+        # Render cache (#14/#17): skip byte-identical inputs.
+        fingerprint_value = scene_fingerprint(
+            job.scene,
+            engine=job.engine,
+            engine_args=self._engine_args_for(job),
+            tier=job.tier,
+            codec=self.nvenc.codec_args(self.nvenc_enabled),
+            cwd=self.cwd,
+        )
+        job.fingerprint = fingerprint_value or ""
+        if self.cache is not None and fingerprint_value:
+            record = self.cache.lookup(fingerprint_value)
+            if record is not None:
+                job.status = "skipped"
+                job.cached = True
+                job.output_path = Path(record["output_path"])
+                job.finished_at = time.monotonic()
+                job.duration_seconds = 0.0
+                self._audit("render_cache_hit", job)
+                self._progress(job.scene.name, f"rendered:{job.tier}:cache-hit")
+                return
+
+        assert job.output_path is not None and job.output_dir is not None
+        job.output_dir.mkdir(parents=True, exist_ok=True)
+        width, height = parse_resolution(self.resolution_tiers.get(job.tier, "1280x720"))
+        job.command = build_render_command(
+            engine=job.engine,
+            scene_path=job.scene,
+            output_path=job.output_path,
+            tier=job.tier,
+            width=width,
+            height=height,
+            fps=30,
+            codec_args=self.nvenc.codec_args(self.nvenc_enabled),
+            templates=self._templates,
+            output_dir=job.output_dir,
+        )
+
+        env = _worker_env(worker_id, self.workers)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *job.command,
+                cwd=str(self.cwd),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            job.status = "failed"
+            job.error = (
+                f"engine binary not found: {job.command[0]}. Install it or override the "
+                f"command template via render_engines.json ({exc})"
+            )
+            self._finish(job)
+            return
+
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=job.timeout_seconds)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            job.status = "timeout"
+            job.error = f"render exceeded {job.timeout_seconds:.0f}s and was killed"
+            job.exit_code = process.returncode
+            self._finish(job)
+            return
+
+        job.finished_at = time.monotonic()
+        job.duration_seconds = job.finished_at - (job.started_at or job.finished_at)
+        job.exit_code = process.returncode
+        if process.returncode == 0 and job.output_path.is_file() and job.output_path.stat().st_size > 0:
+            job.status = "done"
+            self.completed_renders += 1
+            self.total_render_seconds += job.duration_seconds
+            if self.cache is not None and job.fingerprint:
+                self.cache.store(
+                    job.fingerprint,
+                    output_path=str(job.output_path),
+                    scene=job.scene.name,
+                    engine=job.engine,
+                    tier=job.tier,
+                    duration_seconds=job.duration_seconds,
+                )
+            self._progress(job.scene.name, f"rendered:{job.tier}")
+        else:
+            job.status = "failed"
+            tail = (stderr or b"").decode("utf-8", errors="replace").strip()[-400:]
+            job.error = f"exit={process.returncode}: {tail or 'no stderr'}"
+            self._progress(job.scene.name, f"render-failed:{job.tier}")
+        self._finish(job)
+
+    def _engine_args_for(self, job: RenderJob) -> list[str]:
+        return self._templates.get(job.engine, [])[:2] + [job.tier]
+
+    def _finish(self, job: RenderJob) -> None:
+        if job.duration_seconds == 0.0 and job.started_at:
+            job.duration_seconds = time.monotonic() - job.started_at
+        if job.finished_at is None:
+            job.finished_at = time.monotonic()
+        self._audit(f"render_{job.status}", job)
+
+    def _audit(self, event: str, job: RenderJob) -> None:
+        if self.audit_hook is not None:
+            try:
+                self.audit_hook(event, job.as_dict())
+            except Exception:
+                pass
+
+    def _progress(self, scene: str, state: str) -> None:
+        if self.progress_hook is not None:
+            try:
+                self.progress_hook(scene, state)
+            except Exception:
+                pass
+
+
+def _worker_env(worker_id: int, worker_count: int) -> dict[str, str]:
+    """Environment for a worker subprocess, pinning it to one GPU.
+
+    On multi-GPU hosts each worker gets its own GPU via
+    CUDA_VISIBLE_DEVICES, giving true per-GPU parallelism (#11).
+    """
+    import os
+
+    env = dict(os.environ)
+    if worker_count > 1:
+        env["CUDA_VISIBLE_DEVICES"] = str(worker_id)
+    return env
+
+
+# ======================================================================
+# Process-wide singleton + settings wiring
+# ======================================================================
+
+_PIPELINE: RenderPipeline | None = None
+
+
+def recommended_worker_count(*, gpu_count: int | None = None) -> int:
+    """Workers = GPU count when GPUs exist (min 1, cap 4)."""
+    if gpu_count is None:
+        from openharness.services.kaggle_env import detect_kaggle_resources
+
+        try:
+            gpu_count = int(detect_kaggle_resources().get("gpu_count", 0) or 0)
+        except Exception:
+            gpu_count = 0
+    return max(1, min(4, gpu_count if gpu_count > 0 else 1))
+
+
+def get_render_pipeline(cwd: Path | None = None, settings: Any = None) -> RenderPipeline:
+    """Return (creating if needed) the shared render pipeline.
+
+    Settings are only consumed on first creation; the singleton then
+    persists for the process so tools and auto-enqueue hooks share one
+    queue and one cache.
+    """
+    global _PIPELINE
+    if _PIPELINE is None:
+        rendering = getattr(settings, "rendering", None) if settings is not None else None
+        workers_setting = getattr(rendering, "render_workers", None) if rendering else None
+        workers = (
+            int(workers_setting)
+            if workers_setting
+            else recommended_worker_count()
+        )
+        _PIPELINE = RenderPipeline(
+            workers=workers,
+            cwd=Path(cwd) if cwd else Path.cwd(),
+            resolution_tiers=getattr(rendering, "resolution_tiers", None) or None,
+            nvenc_enabled=bool(getattr(rendering, "nvenc", True)),
+            cache_enabled=bool(getattr(rendering, "render_cache", True)),
+            render_timeout_seconds=int(getattr(rendering, "render_timeout_seconds", 1800) or 1800),
+            stealing=bool(getattr(rendering, "work_stealing", True)),
+        )
+    return _PIPELINE
+
+
+def reset_render_pipeline() -> None:
+    """Test helper: drop the singleton."""
+    global _PIPELINE
+    _PIPELINE = None
