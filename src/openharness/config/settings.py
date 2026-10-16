@@ -537,6 +537,37 @@ class ImageGenerationConfig(BaseModel):
         return bool(self.api_key or self.provider in {"auto", "codex"})
 
 
+class SceneGenConfig(BaseModel):
+    """Configuration for the batch_scene tool (scene code generation).
+
+    Separate from ImageGenerationConfig because scene generation uses
+    text models (gpt-4o, claude-sonnet) not image models, and may use
+    a different provider / endpoint for cost reasons.
+    """
+
+    model: str = "gpt-4o"
+    api_key: str = ""
+    base_url: str = ""
+    max_tokens: int = 16384
+    temperature: float = 0.7
+
+    @classmethod
+    def from_env(cls) -> "SceneGenConfig":
+        """Load scene gen config from environment variables."""
+        return cls(
+            model=os.environ.get("OPENHARNESS_SCENE_GEN_MODEL", "gpt-4o").strip() or "gpt-4o",
+            api_key=os.environ.get("OPENHARNESS_SCENE_GEN_API_KEY", "").strip(),
+            base_url=os.environ.get("OPENHARNESS_SCENE_GEN_BASE_URL", "").strip(),
+            max_tokens=int(os.environ.get("OPENHARNESS_SCENE_GEN_MAX_TOKENS", "16384") or 16384),
+            temperature=float(os.environ.get("OPENHARNESS_SCENE_GEN_TEMPERATURE", "0.7") or 0.7),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        """Return True when an API key is available."""
+        return bool(self.api_key)
+
+
 class VisionModelConfig(BaseModel):
     """Configuration for the vision model used by the image_to_text tool.
 
@@ -644,6 +675,9 @@ class Settings(BaseModel):
 
     # Image generation model
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+
+    # Scene generation model (for batch_scene tool)
+    scene_gen: SceneGenConfig = Field(default_factory=SceneGenConfig)
 
     def merged_profiles(self) -> dict[str, ProviderProfile]:
         """Return the saved profiles merged over the built-in catalog."""

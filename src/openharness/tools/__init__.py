@@ -4,6 +4,8 @@ from openharness.tools.ask_user_question_tool import AskUserQuestionTool
 from openharness.tools.agent_tool import AgentTool
 from openharness.tools.bash_tool import BashTool
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
+from openharness.tools.batch_scene_tool import BatchSceneTool
+from openharness.tools.brand_kit_tool import BrandKitTool
 from openharness.tools.brief_tool import BriefTool
 from openharness.tools.config_tool import ConfigTool
 from openharness.tools.cron_create_tool import CronCreateTool
@@ -61,6 +63,8 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         GrepTool(),
         ImageToTextTool(),
         ImageGenerationTool(),
+        BatchSceneTool(),
+        BrandKitTool(),
         SkillTool(),
         ToolSearchTool(),
         WebFetchTool(),

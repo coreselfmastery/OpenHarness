@@ -90,6 +90,32 @@ def _resolve_image_generation_config(settings) -> dict[str, str]:
     return resolved
 
 
+def _resolve_scene_gen_config(settings) -> dict[str, str]:
+    """Resolve scene generation config from settings + env.
+
+    Falls back to OPENAI_API_KEY if no scene-gen-specific key is set,
+    so users don't need to configure a separate key unless they want
+    a different provider for scene gen.
+    """
+    from openharness.config.settings import SceneGenConfig
+
+    cfg = settings.scene_gen
+    env_cfg = SceneGenConfig.from_env()
+    api_key = cfg.api_key or env_cfg.api_key
+    if not api_key:
+        # Fall back to the main OPENAI_API_KEY so users don't have to
+        # configure a separate key for scene gen.
+        import os
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    return {
+        "model": cfg.model or env_cfg.model,
+        "api_key": api_key,
+        "base_url": cfg.base_url or env_cfg.base_url,
+        "max_tokens": str(cfg.max_tokens or env_cfg.max_tokens),
+        "temperature": str(cfg.temperature or env_cfg.temperature),
+    }
+
+
 def _resolve_vision_config(settings) -> dict[str, str]:
     """Resolve the vision model configuration from settings or environment.
 
@@ -494,6 +520,8 @@ async def build_runtime(
             "edit_approval_prompt": edit_approval_prompt,
             "vision_model_config": _resolve_vision_config(settings),
             "image_generation_config": _resolve_image_generation_config(settings),
+            # Scene generation config (for batch_scene tool)
+            "scene_gen_config": _resolve_scene_gen_config(settings),
             # Optimization #3: expose resolved settings to tools (agent_tool
             # reads auto_context_inject / auto_context_files from here).
             "settings": settings,
