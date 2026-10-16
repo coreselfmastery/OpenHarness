@@ -560,10 +560,15 @@ def test_optimization_10_auto_save_writes_snapshot(tmp_path: Path, monkeypatch):
 
 
 # Optimization #2: batch_size
-def test_optimization_2_batch_size_default_is_1():
-    """Item 2: batch_size defaults to 1 (original behaviour)."""
+def test_optimization_2_batch_size_default_is_unset():
+    """Item 2: batch_size defaults to None (sentinel for 'not set').
+
+    The effective default is 1 — see ``_effective_batch_size()`` in
+    runtime.py. The None sentinel lets Kaggle auto-detection distinguish
+    'user did not set' from 'user explicitly set 1'.
+    """
     settings = Settings()
-    assert settings.batch_size == 1
+    assert settings.batch_size is None
 
 
 def test_optimization_2_env_override_sets_batch_size():
@@ -588,8 +593,10 @@ def test_optimization_2_invalid_batch_size_is_ignored():
     try:
         os.environ["OPENHARNESS_BATCH_SIZE"] = "not-an-int"
         settings = _apply_env_overrides(Settings())
-        # Should fall back to default (1), not raise
-        assert settings.batch_size == 1
+        # Invalid value is ignored → falls back to None sentinel.
+        # The effective default (1) is applied at runtime via
+        # ``int(settings.batch_size or 1)`` in runtime.py.
+        assert settings.batch_size is None
     finally:
         if old is None:
             os.environ.pop("OPENHARNESS_BATCH_SIZE", None)

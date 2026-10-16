@@ -229,9 +229,20 @@ class AnthropicApiClient:
         if request.thinking_budget is not None and request.thinking_budget > 0:
             model_lower = (request.model or "").lower()
             if _model_supports_anthropic_thinking(model_lower):
-                # Anthropic requires budget_tokens < max_tokens; clamp.
-                budget = min(request.thinking_budget, max(1024, request.max_tokens - 1024))
-                params["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                # Anthropic constraints:
+                # - budget_tokens >= 1024 (minimum)
+                # - budget_tokens < max_tokens
+                # We clamp to satisfy both. If max_tokens < 2048, we
+                # can't satisfy the minimum, so we skip thinking entirely
+                # (better to run without thinking than to 400 the request).
+                min_budget = 1024
+                max_allowed = request.max_tokens - 1
+                if max_allowed < min_budget:
+                    # max_tokens too small for thinking — skip.
+                    pass
+                else:
+                    budget = max(min_budget, min(request.thinking_budget, max_allowed))
+                    params["thinking"] = {"type": "enabled", "budget_tokens": budget}
         if self._claude_oauth:
             params["betas"] = claude_oauth_betas()
             params["metadata"] = {

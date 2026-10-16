@@ -982,22 +982,64 @@ async def _execute_tool_call(
 
     log.debug("executing %s ...", tool_name)
     # Optimization #7: check the tool result cache before executing.
+    # Use ``get_or_execute`` which is thundering-herd-safe: if two
+    # coroutines call the same read-only tool concurrently, only the
+    # first executes; the second awaits the first's result.
     from openharness.services.tool_cache import get_tool_cache
     tool_cache = get_tool_cache()
-    if (
+    use_cache = (
         tool_cache is not None
         and tool.is_read_only(parsed_input)
         and tool_cache.is_cacheable(tool_name)
-    ):
-        cached = tool_cache.get(tool_name, dict(tool_input))
-        if cached is not None:
-            log.debug("tool cache HIT for %s", tool_name)
+    )
+    if use_cache:
+        async def _execute_and_format():
+            t0 = time.monotonic()
+            tool_exec_metadata_inner = dict(context.tool_metadata or {})
+            tool_exec_metadata_inner.setdefault("tool_registry", context.tool_registry)
+            tool_exec_metadata_inner.setdefault("ask_user_prompt", context.ask_user_prompt)
+            inner_result = await tool.execute(
+                parsed_input,
+                ToolExecutionContext(
+                    cwd=context.cwd,
+                    metadata=tool_exec_metadata_inner,
+                    hook_executor=context.hook_executor,
+                ),
+            )
+            elapsed_inner = time.monotonic() - t0
+            log.debug("executed %s in %.2fs err=%s output_len=%d",
+                      tool_name, elapsed_inner, inner_result.is_error, len(inner_result.output or ""))
+            inner_inline, inner_artifact = _offload_tool_output_if_needed(
+                tool_name=tool_name,
+                tool_use_id=tool_use_id,
+                output=inner_result.output,
+            )
+            if inner_artifact is not None:
+                _remember_active_artifact(context.tool_metadata, str(inner_artifact))
+            return {
+                "output": inner_inline,
+                "is_error": inner_result.is_error,
+                "metadata": dict(inner_result.metadata or {}),
+            }
+
+        cached_result = await tool_cache.get_or_execute(
+            tool_name, dict(tool_input), _execute_and_format
+        )
+        if cached_result is not None:
+            log.debug("tool cache returned result for %s (err=%s)", tool_name, cached_result.get("is_error"))
+            # ``get_or_execute`` returns the executor's result dict even
+            # for errors (it just doesn't cache them). Return it here so
+            # the user sees the error from the first execution, not a
+            # confusing re-run.
             return ToolResultBlock(
                 tool_use_id=tool_use_id,
-                content=cached.get("output", ""),
-                is_error=bool(cached.get("is_error", False)),
-                result_metadata=dict(cached.get("metadata") or {}),
+                content=cached_result.get("output", ""),
+                is_error=bool(cached_result.get("is_error", False)),
+                result_metadata=dict(cached_result.get("metadata") or {}),
             )
+        # cached_result is None → executor returned None (shouldn't happen
+        # for normal tools) or raised. Fall through to the non-cached path.
+
     t0 = time.monotonic()
     # Build the tool execution metadata, starting from the engine's
     # ``tool_metadata`` so we carry the mcp_manager, settings, etc.
@@ -1028,24 +1070,9 @@ async def _execute_tool_call(
         is_error=result.is_error,
         result_metadata=dict(result.metadata or {}),
     )
-    # Optimization #7: cache successful read-only results; invalidate on mutating tools.
-    if tool_cache is not None:
-        if tool_cache.is_mutating(tool_name):
-            tool_cache.invalidate_all()
-        elif (
-            tool.is_read_only(parsed_input)
-            and tool_cache.is_cacheable(tool_name)
-            and not tool_result.is_error
-        ):
-            tool_cache.put(
-                tool_name,
-                dict(tool_input),
-                {
-                    "output": tool_result.content,
-                    "is_error": tool_result.is_error,
-                    "metadata": dict(result.metadata or {}),
-                },
-            )
+    # Optimization #7: invalidate cache on mutating tools (successful or not).
+    if tool_cache is not None and tool_cache.is_mutating(tool_name):
+        tool_cache.invalidate_all()
     _record_tool_carryover(
         context,
         tool_name=tool_name,

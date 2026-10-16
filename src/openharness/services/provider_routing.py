@@ -122,7 +122,9 @@ class RoutedStreamingClient(SupportsStreamingMessages):
 
         Yields ``ApiRetryEvent`` events to the caller so the UI can show
         "falling back to <provider>" without losing the streaming
-        semantics.
+        semantics. We emit the event on *every* fallback (even when
+        ``delay_seconds=0``) so the user always knows a fallback
+        happened — silent fallback is bad UX.
         """
         last_error: Exception | None = None
         for index, route in enumerate(self._routes):
@@ -131,13 +133,17 @@ class RoutedStreamingClient(SupportsStreamingMessages):
                 self._stats.primary_attempts += 1
             else:
                 self._stats.fallback_attempts += 1
+                # Always emit a retry event so the UI/user can see that
+                # a fallback is happening. Previously this was only
+                # emitted when delay_seconds > 0, which made
+                # delay_seconds=0 fallbacks completely silent.
+                yield ApiRetryEvent(
+                    message=f"Primary failed; falling back to {route.name}",
+                    attempt=index,
+                    max_attempts=len(self._routes),
+                    delay_seconds=route.delay_seconds,
+                )
                 if route.delay_seconds > 0:
-                    yield ApiRetryEvent(
-                        message=f"Primary failed; falling back to {route.name}",
-                        attempt=index,
-                        max_attempts=len(self._routes),
-                        delay_seconds=route.delay_seconds,
-                    )
                     await asyncio.sleep(route.delay_seconds)
             try:
                 async for event in route.client.stream_message(request):

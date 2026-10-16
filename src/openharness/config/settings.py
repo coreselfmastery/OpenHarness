@@ -606,8 +606,13 @@ class Settings(BaseModel):
     verbose: bool = False
 
     # --- Performance / scaling settings (top-10 optimizations) ---
-    max_concurrent_agents: int = 5
-    batch_size: int = 1
+    # Use ``None`` as the sentinel for "user did not set this" so Kaggle
+    # auto-detection can distinguish explicit-5 from default-5. When the
+    # runtime loads settings, it converts ``None`` to the documented
+    # default; Kaggle auto-detection runs BEFORE that conversion so it
+    # can fill in hardware-aware values without overriding explicit choices.
+    max_concurrent_agents: int | None = None
+    batch_size: int | None = None
     auto_compact_threshold_ratio: float | None = None
     trusted_project: bool = False
     # Optimization #6 + #8: extra paths auto-approved when trusted_project

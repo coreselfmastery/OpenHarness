@@ -16,6 +16,7 @@ and add zero overhead (a single bool check at entry).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -65,6 +66,11 @@ class ToolResultCache:
         self._hits = 0
         self._misses = 0
         self._invalidations = 0
+        # In-flight execution tracker: when two coroutines request the
+        # same cache key concurrently, only the first executes the tool;
+        # the second awaits the same future. Prevents thundering-herd
+        # on cache misses for slow tools (large read_file, expensive grep).
+        self._in_flight: dict[str, "asyncio.Future[dict[str, Any] | None]"] = {}
 
     @staticmethod
     def is_cacheable(tool_name: str) -> bool:
@@ -149,6 +155,9 @@ class ToolResultCache:
         if self._entries:
             self._invalidations += len(self._entries)
             self._entries.clear()
+        # Also cancel any in-flight executions — their results would be
+        # stale because the filesystem may have changed.
+        self._in_flight.clear()
 
     def stats(self) -> dict[str, int]:
         """Return cache hit/miss/invalidation counters (for debugging)."""
@@ -165,6 +174,78 @@ class ToolResultCache:
         self._hits = 0
         self._misses = 0
         self._invalidations = 0
+
+    async def get_or_execute(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        executor: "Any",
+    ) -> dict[str, Any] | None:
+        """Return cached result, or execute ``executor()`` and cache it.
+
+        This is the thundering-herd-safe entry point. When two coroutines
+        call this with the same ``(tool_name, tool_input)`` concurrently:
+
+        1. The first coroutine calls ``executor()`` and stores the result.
+        2. The second coroutine awaits the same future — it does NOT
+           call ``executor()`` again.
+
+        Returns the cached result dict (``{output, is_error, metadata}``),
+        or ``None`` if the executor returned an error (errors are not
+        cached, so the next call retries).
+
+        Args:
+            tool_name: Tool name for the cache key.
+            tool_input: Tool input dict for the cache key.
+            executor: An async callable (zero-arg) returning a dict with
+                ``output``, ``is_error``, ``metadata`` keys.
+        """
+        # Fast path: cache hit.
+        cached = self.get(tool_name, tool_input)
+        if cached is not None:
+            return cached
+
+        key = self.make_key(tool_name, tool_input)
+
+        # Check if another coroutine is already executing this exact call.
+        existing_future = self._in_flight.get(key)
+        if existing_future is not None:
+            # Another coroutine is executing. Await its result instead
+            # of running the executor again.
+            try:
+                result = await existing_future
+            except Exception:
+                # The in-flight execution raised — fall through to
+                # execute ourselves (rare; usually means the executor
+                # had a bug). Don't cache the error.
+                return None
+            if result is None:
+                # The other coroutine's executor returned an error —
+                # don't reuse it; execute ourselves to retry.
+                pass
+            else:
+                # Reuse the other coroutine's result.
+                return result
+
+        # We're the first coroutine. Create a future so concurrent
+        # callers can await our result.
+        future: "asyncio.Future[dict[str, Any] | None]" = asyncio.get_event_loop().create_future()
+        self._in_flight[key] = future
+        try:
+            try:
+                result = await executor()
+            except Exception:
+                # Executor raised — don't cache, don't propagate to
+                # waiters (let them retry on next call).
+                future.set_result(None)
+                self._in_flight.pop(key, None)
+                raise
+            if isinstance(result, dict) and not result.get("is_error"):
+                self.put(tool_name, tool_input, result)
+            future.set_result(result if isinstance(result, dict) else None)
+            return result if isinstance(result, dict) else None
+        finally:
+            self._in_flight.pop(key, None)
 
 
 class _CacheEntry:

@@ -68,8 +68,11 @@ class QueryEngine:
         # Optimization #7 + #10: count user turns so we only auto-save
         # every ``auto_save_interval`` turns (default 10). Saving on
         # every turn is too aggressive for long video-generation runs.
+        # Initial _last_save_turn is -interval so the FIRST turn always
+        # saves (otherwise turns 1..N-1 have no snapshot, which is
+        # dangerous on Kaggle where notebooks die without warning).
         self._turn_count = 0
-        self._last_save_turn = 0
+        self._last_save_turn = -max(1, int(getattr(settings, "auto_save_interval", 10) or 10)) if settings is not None else -10
 
     @property
     def messages(self) -> list[ConversationMessage]:

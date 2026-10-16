@@ -85,8 +85,13 @@ class SubprocessBackend:
                 argv = [teammate_cmd, "--task-worker"] + flags
 
         manager = get_task_manager()
-        # Optimization #1: acquire the agent concurrency semaphore before spawning.
-        from openharness.services.agent_concurrency import with_agent_limit
+        # Optimization #1: acquire the agent concurrency permit before
+        # spawning, and hold it until the subprocess completes. This is
+        # the correct cap: ``create_agent_task`` returns in milliseconds
+        # (it just forks the subprocess), so capping around the spawn
+        # call alone does nothing. We register a completion listener
+        # that releases the permit when the task reaches a terminal state.
+        from openharness.services.agent_concurrency import acquire_permit_for_task
 
         async def _do_spawn() -> Any:
             return await manager.create_agent_task(
@@ -101,7 +106,7 @@ class SubprocessBackend:
             )
 
         try:
-            record = await with_agent_limit(_do_spawn)
+            record = await acquire_permit_for_task(_do_spawn, task_manager=manager)
         except Exception as exc:
             logger.error("Failed to spawn teammate %s: %s", agent_id, exc)
             return SpawnResult(

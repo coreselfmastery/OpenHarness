@@ -102,9 +102,14 @@ def apply_kaggle_defaults_to_settings(settings: Any) -> Any:
     if not resources.get("is_kaggle"):
         return settings  # No-op off Kaggle
     try:
-        if getattr(settings, "max_concurrent_agents", 5) == 5:
+        # Use ``None`` sentinel to distinguish "user didn't set this" from
+        # "user explicitly set the default value". This fixes the bug where
+        # ``max_concurrent_agents=5`` (explicit) was overridden to 16 on
+        # Kaggle because the auto-detection couldn't tell it apart from
+        # the default of 5.
+        if getattr(settings, "max_concurrent_agents", None) is None:
             settings.max_concurrent_agents = get_recommended_concurrency(resources)
-        if getattr(settings, "batch_size", 1) == 1:
+        if getattr(settings, "batch_size", None) is None:
             settings.batch_size = get_recommended_batch_size(resources)
         if not getattr(settings, "auto_save", False):
             # On Kaggle, auto-save should default ON (notebooks die without warning)

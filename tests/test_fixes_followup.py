@@ -599,27 +599,35 @@ async def test_fix_7_auto_save_interval_skips_until_threshold(tmp_path: Path, mo
         tool_metadata={"session_id": "test"},
     )
 
-    # Run 3 turns — should NOT save (interval=5, only save at turn 5)
+    # Turn 1 — should save (first turn always saves so we have a baseline
+    # snapshot even if the notebook dies after one turn).
+    [event async for event in engine.submit_message("hi")]
+    assert save_count == 1, f"Should have saved on turn 1 (first-turn guarantee), got {save_count} saves"
+
+    # Turns 2-4 — no save (interval=5, last save was turn 1)
     for _ in range(3):
         [event async for event in engine.submit_message("hi")]
-    assert save_count == 0, f"Should not have saved in turns 1-3, got {save_count} saves"
+    assert save_count == 1, f"Should not have saved in turns 2-4, got {save_count} saves"
 
-    # Turn 4 — still no save
+    # Turn 5 — should save again (1 + interval=5 = 6, but we save at turn 6
+    # because last_save_turn=1 and 6-1=5=interval). Actually with our logic,
+    # turn 5 has _turn_count=5, _last_save_turn=1, diff=4 < 5, no save.
+    # Turn 6 has diff=5, saves.
     [event async for event in engine.submit_message("hi")]
-    assert save_count == 0
+    assert save_count == 1, f"Turn 5 should not save (diff=4 < interval=5), got {save_count} saves"
 
-    # Turn 5 — should save
+    # Turn 6 — should save (diff = 6 - 1 = 5 = interval)
     [event async for event in engine.submit_message("hi")]
-    assert save_count == 1, f"Should have saved on turn 5, got {save_count} saves"
+    assert save_count == 2, f"Turn 6 should save (diff=5=interval), got {save_count} saves"
 
-    # Turns 6-9 — no save
+    # Turns 7-10 — no save
     for _ in range(4):
         [event async for event in engine.submit_message("hi")]
-    assert save_count == 1
-
-    # Turn 10 — should save again
-    [event async for event in engine.submit_message("hi")]
     assert save_count == 2
+
+    # Turn 11 — should save (11 - 6 = 5 = interval)
+    [event async for event in engine.submit_message("hi")]
+    assert save_count == 3
 
 
 def test_fix_7_auto_save_interval_env_override():
