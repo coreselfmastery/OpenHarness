@@ -2177,6 +2177,19 @@ def provider_remove(
 # Main command
 # ---------------------------------------------------------------------------
 
+def _forward_thinking_budget_to_env(value: int | None) -> int | None:
+    """Typer callback: mirror ``--thinking-budget`` into the env override.
+
+    The settings loader reads ``OPENHARNESS_THINKING_BUDGET``, so exporting
+    the flag through the normal env-override path makes it work for every
+    subcommand without touching each command's signature. Returns the value
+    unchanged so it is still visible to click/typer.
+    """
+    if value is not None:
+        os.environ["OPENHARNESS_THINKING_BUDGET"] = str(value)
+    return value
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -2242,11 +2255,7 @@ def main(
         # Optimization #9: forward to settings via env var so the engine
         # picks it up through the normal env-override path. We use a
         # callback so the flag works on every subcommand.
-        callback=lambda val: (
-            os.environ.__setitem__("OPENHARNESS_THINKING_BUDGET", str(val))
-            if val is not None
-            else None
-        ) if val is not None else None,
+        callback=_forward_thinking_budget_to_env,
         help="Per-call reasoning token budget for thinking models (o1/o3/gpt-5). 0 = no reasoning.",
         rich_help_panel="Model & Effort",
     ),

@@ -80,6 +80,11 @@ class QueryEngine:
         return list(self._messages)
 
     @property
+    def cwd(self) -> Path:
+        """Return the resolved working directory this engine operates in."""
+        return self._cwd
+
+    @property
     def max_turns(self) -> int | None:
         """Return the maximum number of agentic turns per user input, if capped."""
         return self._max_turns

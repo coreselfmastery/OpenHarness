@@ -120,16 +120,27 @@ def estimate_message_tokens(messages: list[ConversationMessage]) -> int:
     ``should_autocompact``) and walks the entire conversation. We cache the
     per-message token count on the message object itself so that repeated
     calls only re-cost newly appended messages.
+
+    Cache validity: the cached token count is only reused when the message's
+    content blocks are the *same objects* as when the count was computed.
+    Several code paths mutate messages in place (time-based microcompact
+    replaces ``msg.content`` with cleared blocks; the query loop swaps a
+    block inside ``msg.content`` when it collapses a tool result), and a
+    naive budget-only check would keep serving the stale pre-mutation
+    count forever. Identity comparison catches every in-place mutation at
+    O(1) per block.
     """
     total = 0
     image_token_estimate = _vision_token_budget_per_image()
     for msg in messages:
         cached = getattr(msg, "_oh_token_cache", None)
         if cached is not None:
-            # Cache hit — but only valid if the image token budget hasn't
-            # changed via env var. Compare the cached budget to the current.
-            cached_budget, cached_tokens = cached
-            if cached_budget == image_token_estimate:
+            cached_budget, cached_tokens, cached_blocks = cached
+            if (
+                cached_budget == image_token_estimate
+                and len(cached_blocks) == len(msg.content)
+                and all(a is b for a, b in zip(cached_blocks, msg.content))
+            ):
                 total += cached_tokens
                 continue
         msg_tokens = _estimate_single_message_tokens(msg, image_token_estimate)
@@ -137,7 +148,11 @@ def estimate_message_tokens(messages: list[ConversationMessage]) -> int:
         # model; we use ``object.__setattr__`` to bypass validation since
         # this is a transient cache, not a real field.
         try:
-            object.__setattr__(msg, "_oh_token_cache", (image_token_estimate, msg_tokens))
+            object.__setattr__(
+                msg,
+                "_oh_token_cache",
+                (image_token_estimate, msg_tokens, tuple(msg.content)),
+            )
         except (AttributeError, TypeError):
             pass  # frozen/immutable model — skip caching
         total += msg_tokens

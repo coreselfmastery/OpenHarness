@@ -59,9 +59,21 @@ All settings have env-var overrides with `OPENHARNESS_` prefix. See
 |---|---|
 | `openharness.services.agent_concurrency` | Asyncio.Semaphore that caps concurrent agent spawns. |
 | `openharness.services.auto_context` | Discovers + injects project context files into spawn prompts. |
-| `openharness.services.provider_routing` | RoutedStreamingClient with automatic fallback. |
-| `openharness.services.tool_cache` | LRU cache for read-only tool results. |
+| `openharness.services.provider_routing` | RoutedStreamingClient with automatic fallback + the shared `build_fallback_route()` config parser. |
+| `openharness.services.tool_cache` | LRU cache for read-only tool results (thundering-herd safe, generation-guarded invalidation). |
 | `openharness.services.kaggle_env` | Hardware detection (CPU, GPU, RAM) + Kaggle auto-defaults. |
+
+### New tools
+
+| Tool | What it really does |
+|---|---|
+| `batch_scene` | Generates code for 5-10 scenes in ONE LLM call (structured BATCH_ID/SCENES response, per-scene lint via `node --check` / `py_compile`, per-scene retry). Scene filenames are validated — no path separators or `..` — so LLM output cannot escape the output directory. |
+| `brand_kit` | Loads `brand.yaml` from the project root; validates scene code against brand anchors (colors, fonts, min type size, safe area), generates a *seeded* creative drift (same project = same drift), and scores brand compliance + creative originality. Brand anchors are also auto-injected into the system prompt when `brand.yaml` exists. |
+| `cost_governor` | In-memory budget tracker: `check` before each LLM call, `record` after, `status`, `reset`. |
+| `audio_qa` | REAL measurements via ffmpeg: true-peak clipping (dBTP via `loudnorm`), integrated loudness (LUFS vs target), silence gaps (`silencedetect`), and a noise-floor probe. Requires ffmpeg on PATH; says so (and fails) when it can't measure. |
+| `determinism_checker` | Static analysis of scene code for non-determinism sources (`Math.random`, `Date.now`, `performance.now`, `uuid4`, ...) with line numbers. Honest about being static — it does not render anything. |
+| `contact_sheet` | Composites a REAL thumbnail grid PNG via ffmpeg (scale + pad + `xstack`); videos contribute their first frame. Writes a manifest alongside; when ffmpeg or decodable inputs are missing it writes the manifest only and says so. |
+| `engine_router` | Keyword routing to the best rendering engine (hyperframes / manim / blender / ffmpeg). |
 
 ### New PermissionChecker API
 
@@ -72,6 +84,10 @@ to disabled.
 
 For the full settings-aware constructor, use
 `openharness.permissions.build_permission_checker(settings, cwd=...)`.
+
+Trusted-path checks resolve symlinks and `..` segments first
+(`os.path.realpath`), so a path like `<project>/../../etc/passwd` can
+never pass as "inside the project".
 
 ## How to enable each optimization
 

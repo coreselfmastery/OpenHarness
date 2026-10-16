@@ -13,24 +13,16 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
-from openharness.api.client import ApiMessageCompleteEvent, ApiMessageRequest, ApiTextDeltaEvent
-from openharness.api.errors import RateLimitFailure
-from openharness.api.usage import UsageSnapshot
 from openharness.config.settings import PermissionSettings, Settings
-from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock
-from openharness.engine.query_engine import QueryEngine
-from openharness.engine.stream_events import ToolExecutionCompleted
 from openharness.permissions.checker import build_permission_checker
 from openharness.permissions.modes import PermissionMode
 from openharness.services.tool_cache import (
     ToolResultCache,
     disable_tool_cache,
-    enable_tool_cache,
     reset_tool_cache,
 )
 
@@ -125,7 +117,7 @@ def test_fix_1_routing_skips_fallbacks_with_missing_api_key():
 async def test_fix_2_batch_size_raises_n_for_image_generation(tmp_path: Path):
     """Item 2: when batch_size=4 is set, image_generation gets n=4 (capped at 10)."""
     from openharness.tools.image_generation_tool import ImageGenerationTool, ImageGenerationToolInput
-    from openharness.tools.base import ToolExecutionContext, ToolRegistry, ToolResult
+    from openharness.tools.base import ToolExecutionContext
 
     # Mock the network call by patching _generate_with_openai on the instance
     tool = ImageGenerationTool()
@@ -345,8 +337,6 @@ async def test_fix_5_fifteen_agents_run_concurrently_without_deadlock():
     from openharness.services.agent_concurrency import (
         configure_agent_concurrency,
         get_agent_semaphore,
-        reset_agent_concurrency,
-        with_agent_limit,
     )
 
     settings = Settings(max_concurrent_agents=15)
@@ -393,7 +383,6 @@ async def test_fix_5_semaphore_blocks_16th_agent_until_one_finishes():
     from openharness.services.agent_concurrency import (
         configure_agent_concurrency,
         get_agent_semaphore,
-        reset_agent_concurrency,
     )
 
     settings = Settings(max_concurrent_agents=15)
@@ -444,9 +433,9 @@ async def test_fix_6_compact_fires_at_60_percent_with_ratio_setting():
     long conversation" without burning real LLM tokens.
     """
     from openharness.engine.query_engine import QueryEngine
-    from openharness.api.client import ApiMessageCompleteEvent, ApiMessageRequest
+    from openharness.api.client import ApiMessageCompleteEvent
     from openharness.api.usage import UsageSnapshot
-    from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock, ToolResultBlock
+    from openharness.engine.messages import ConversationMessage, TextBlock
 
     # Use a tiny context window so we can fill it with few messages.
     # Default context window for unknown models is 200K; we override to 4000.
@@ -554,7 +543,7 @@ def test_fix_6_default_threshold_is_higher_than_60_percent():
 async def test_fix_7_auto_save_interval_skips_until_threshold(tmp_path: Path, monkeypatch):
     """Item 7: with auto_save_interval=5, snapshot is only written on turns 5, 10, 15, ..."""
     from openharness.engine.query_engine import QueryEngine
-    from openharness.api.client import ApiMessageCompleteEvent, ApiMessageRequest
+    from openharness.api.client import ApiMessageCompleteEvent
     from openharness.api.usage import UsageSnapshot
     from openharness.engine.messages import ConversationMessage, TextBlock
 
@@ -574,7 +563,6 @@ async def test_fix_7_auto_save_interval_skips_until_threshold(tmp_path: Path, mo
 
     # Patch save_session_snapshot to count calls
     import openharness.services.session_storage as session_storage
-    original_save = session_storage.save_session_snapshot
 
     def _counting_save(**kwargs):
         nonlocal save_count

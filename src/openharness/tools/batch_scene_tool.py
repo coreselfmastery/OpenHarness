@@ -36,7 +36,6 @@ Retry logic:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -160,13 +159,6 @@ class BatchSceneTool(BaseTool):
         if not isinstance(config, dict):
             config = {}
 
-        # Apply batch_size from settings if the caller passed fewer scenes
-        # than the configured batch size AND didn't explicitly cap it.
-        batch_size = int(context.metadata.get("batch_size", 1) or 1) if context.metadata else 1
-        # We don't expand the caller's scene list — they asked for N scenes.
-        # batch_size is a hint for how many to generate per call, which we
-        # already do (all scenes in `arguments.scenes` go in one call).
-
         if not arguments.scenes:
             return ToolResult(output="No scenes provided. Pass a list of scene descriptions.", is_error=True)
 
@@ -248,11 +240,33 @@ class BatchSceneTool(BaseTool):
                 })
                 continue
 
-            # Write the file
-            file_path = output_dir / scene.file
+            # Write the file. The filename comes from the LLM response, so
+            # it is untrusted: reject anything that tries to escape
+            # output_dir (path separators, "..", absolute paths, null
+            # bytes) instead of relying on the model to behave.
+            filename = scene.file.strip()
+            if (
+                not filename
+                or filename in {".", ".."}
+                or "/" in filename
+                or "\\" in filename
+                or "\x00" in filename
+            ):
+                failed.append({
+                    "scene_index": scene.index,
+                    "file": scene.file,
+                    "error": "invalid filename (path separators / traversal are not allowed)",
+                })
+                continue
+            file_path = output_dir / filename
             try:
                 file_path.write_text(code_to_write, encoding="utf-8")
-                written.append(str(file_path.relative_to(context.cwd)) if str(file_path).startswith(str(context.cwd)) else str(file_path))
+                try:
+                    written.append(str(file_path.relative_to(context.cwd)))
+                except ValueError:
+                    # Output dir is outside the project cwd — report the
+                    # absolute path instead of crashing.
+                    written.append(str(file_path))
             except OSError as exc:
                 failed.append({
                     "scene_index": scene.index,
@@ -262,7 +276,7 @@ class BatchSceneTool(BaseTool):
 
         # Step 4: Build summary
         summary_lines = [
-            f"[Batch scene generation complete]",
+            "[Batch scene generation complete]",
             f"Batch ID: {batch_id}",
             f"Scenes requested: {len(arguments.scenes)}",
             f"Scenes parsed: {len(parse_result.scenes)}",
@@ -664,7 +678,7 @@ def _lint_js(code: str) -> tuple[bool, str]:
         # Extract the error line
         error_line = result.stderr.strip().splitlines()[0] if result.stderr else "unknown error"
         return False, f"node --check: {error_line}"
-    except Exception as exc:
+    except Exception:
         # Fallback to brace check if node invocation fails
         return _lint_brace_balance(code)
 

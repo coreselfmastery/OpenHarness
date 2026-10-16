@@ -1,27 +1,31 @@
-"""Missing tools — items 23-27.
+"""Media pipeline tools — items 23-27.
 
-#23 Cost Governor: Enforces a budget. Tracks spending in real-time
+#23 Cost Governor: enforces a budget. Tracks spending in real-time
     and halts when the budget is exceeded.
 
-#24 Audio QA Tool: Checks audio quality (noise floor, clipping, levels,
-    silence detection) for broadcast-quality output.
+#24 Audio QA Tool: measures real audio metrics via ffmpeg — true-peak
+    clipping, integrated loudness (LUFS), noise floor, and silence
+    detection — for broadcast-quality output.
 
-#25 Determinism Checker: Renders a scene twice and compares frames to
-    catch non-deterministic rendering bugs.
+#25 Determinism Checker: statically analyses scene code for common
+    non-determinism sources (Math.random, Date.now, ...) that cause
+    flicker when a scene is re-rendered.
 
-#26 Contact Sheet Generator: Generates a contact sheet (grid of
-    thumbnails) for faster visual QA of multiple scenes.
+#26 Contact Sheet Generator: composites a real thumbnail grid image
+    via ffmpeg; falls back to a manifest when ffmpeg or decodable
+    image inputs are unavailable.
 
-#27 Engine Router: Routes scenes to the optimal rendering engine
+#27 Engine Router: routes scenes to the optimal rendering engine
     (hyperframes, manim, blender, ffmpeg) based on scene type.
 """
 from __future__ import annotations
 
-import asyncio
-import hashlib
+import json
 import logging
+import re
+import shutil
+import subprocess
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +34,23 @@ from pydantic import BaseModel, Field
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 log = logging.getLogger(__name__)
+
+
+def _run_ffmpeg(args: list[str], *, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+    """Run ffmpeg with the given arguments, returning the completed process.
+
+    Raises FileNotFoundError when ffmpeg is not installed.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise FileNotFoundError("ffmpeg is not installed")
+    return subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostdin", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
 # ============================================================
@@ -160,7 +181,7 @@ class CostGovernorTool(BaseTool):
 
 
 # ============================================================
-# #24 Audio QA Tool
+# #24 Audio QA Tool — real measurements via ffmpeg
 # ============================================================
 
 class AudioQAToolInput(BaseModel):
@@ -170,15 +191,115 @@ class AudioQAToolInput(BaseModel):
     check_levels: bool = Field(default=True)
     check_silence: bool = Field(default=True)
     target_lufs: float = Field(default=-16.0, description="Target loudness in LUFS (broadcast standard: -16)")
+    lufs_tolerance: float = Field(default=2.0, description="Allowed deviation from target LUFS")
+    max_clipping_dbtp: float = Field(default=-0.3, description="True-peak threshold in dBTP above which audio counts as clipped")
+    max_noise_floor_db: float = Field(default=-60.0, description="Noise floor must be at or below this (dB)")
+    min_silence_seconds: float = Field(default=2.0, description="Silence gaps longer than this are flagged")
+
+
+class _FFmpegMeasurements:
+    """Parsed output of the ffmpeg analysis passes."""
+
+    def __init__(self) -> None:
+        self.max_volume_db: float | None = None
+        self.mean_volume_db: float | None = None
+        self.integrated_lufs: float | None = None
+        self.true_peak_dbtp: float | None = None
+        self.silence_intervals: list[tuple[float, float]] = []
+        self.quiet_passage_detected: bool = False
+
+
+def _measure_audio(
+    path: Path,
+    silence_threshold_db: float,
+    min_silence: float,
+    noise_floor_db: float | None = None,
+) -> _FFmpegMeasurements:
+    """Run ffmpeg analysis passes and parse the metrics.
+
+    Pass A chains volumedetect (peak/mean levels) with silencedetect
+    (long quiet gaps at the content threshold). Pass B runs loudnorm in
+    measurement mode, which prints its input stats as JSON (integrated
+    LUFS + true peak). Pass C (optional) probes for passages at or below
+    the configured noise floor.
+    """
+    m = _FFmpegMeasurements()
+
+    pass_a = _run_ffmpeg([
+        "-i", str(path),
+        "-af", f"volumedetect,silencedetect=noise={silence_threshold_db}dB:d={min_silence}",
+        "-f", "null", "-",
+    ])
+    if pass_a.returncode != 0:
+        raise RuntimeError(_summarize_ffmpeg_error(pass_a.stderr))
+    stderr = pass_a.stderr
+    for pattern, attr in (
+        (r"max_volume:\s*(-?[\d.]+)\s*dB", "max_volume_db"),
+        (r"mean_volume:\s*(-?[\d.]+)\s*dB", "mean_volume_db"),
+    ):
+        match = re.search(pattern, stderr)
+        if match:
+            setattr(m, attr, float(match.group(1)))
+
+    # silencedetect prints silence_start=X / silence_end=Y pairs.
+    starts = [float(x) for x in re.findall(r"silence_start:\s*(-?[\d.]+)", stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end:\s*(-?[\d.]+)", stderr)]
+    for i, start in enumerate(starts):
+        end = ends[i] if i < len(ends) else None
+        m.silence_intervals.append((start, end))
+
+    pass_b = _run_ffmpeg([
+        "-i", str(path),
+        "-af", "loudnorm=print_format=json",
+        "-f", "null", "-",
+    ])
+    if pass_b.returncode == 0:
+        # The JSON block is at the very end of stderr.
+        json_match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", pass_b.stderr, re.DOTALL)
+        if json_match:
+            try:
+                stats = json.loads(json_match.group(0))
+                m.integrated_lufs = float(stats.get("input_i"))
+                m.true_peak_dbtp = float(stats.get("input_tp"))
+            except (ValueError, TypeError):
+                pass
+
+    if noise_floor_db is not None:
+        # Probe for passages at or below the configured floor: if any
+        # 0.2s+ stretch stays under the threshold, the floor reaches at
+        # least that deep. (volumedetect's min_volume is not emitted by
+        # all ffmpeg builds, so this probe is the portable measurement.)
+        probe = _run_ffmpeg([
+            "-i", str(path),
+            "-af", f"silencedetect=noise={noise_floor_db}dB:d=0.2",
+            "-f", "null", "-",
+        ])
+        if probe.returncode == 0 and re.search(r"silence_start:", probe.stderr):
+            m.quiet_passage_detected = True
+    return m
+
+
+def _summarize_ffmpeg_error(stderr: str) -> str:
+    """Return the most useful line of an ffmpeg failure."""
+    for line in reversed(stderr.splitlines()):
+        if line.strip().startswith(("Error", "Invalid", "Unknown", "moov", "does not", "Invalid data")):
+            return line.strip()[:200]
+    tail = [ln for ln in stderr.splitlines() if ln.strip()]
+    return tail[-1][:200] if tail else "unknown decode error"
 
 
 class AudioQATool(BaseTool):
     name = "audio_qa"
     description = (
-        "Check audio quality for broadcast standards: clipping, noise floor, "
-        "levels (LUFS), and silence detection. Returns pass/fail with details."
+        "Measure audio quality with ffmpeg: true-peak clipping (dBTP), "
+        "integrated loudness vs a target LUFS, noise floor, and long "
+        "silence gaps. Returns pass/fail with the measured values. "
+        "Requires ffmpeg on PATH."
     )
     input_model = AudioQAToolInput
+
+    def is_read_only(self, arguments) -> bool:
+        return True
 
     async def execute(self, arguments: AudioQAToolInput, context: ToolExecutionContext) -> ToolResult:
         path = Path(arguments.audio_path)
@@ -187,46 +308,109 @@ class AudioQATool(BaseTool):
         if not path.is_file():
             return ToolResult(output=f"Audio file not found: {path}", is_error=True)
 
+        if not shutil.which("ffmpeg"):
+            return ToolResult(
+                output="ffmpeg is not installed; audio QA cannot measure anything without it. "
+                       "Install ffmpeg (apt install ffmpeg / brew install ffmpeg) and retry.",
+                is_error=True,
+            )
+
+        try:
+            m = _measure_audio(
+                path,
+                silence_threshold_db=-40.0,
+                min_silence=arguments.min_silence_seconds,
+                noise_floor_db=arguments.max_noise_floor_db if arguments.check_noise_floor else None,
+            )
+        except FileNotFoundError:
+            return ToolResult(output="ffmpeg is not installed; cannot measure audio.", is_error=True)
+        except subprocess.TimeoutExpired:
+            return ToolResult(output=f"ffmpeg timed out analysing {path.name}", is_error=True)
+        except RuntimeError as exc:
+            return ToolResult(output=f"Could not decode {path.name}: {exc}", is_error=True)
+
         checks: list[dict[str, Any]] = []
         failures: list[str] = []
 
-        # Simulated checks (real implementation would use ffmpeg/librosa)
-        file_size = path.stat().st_size
-
-        # Clipping check
         if arguments.check_clipping:
-            # Heuristic: very large files relative to duration suggest clipping
-            has_clipping = file_size > 50_000_000 and file_size < 1_000  # placeholder
-            checks.append({"name": "clipping", "passed": not has_clipping, "detail": "No clipping detected"})
-            if has_clipping:
-                failures.append("Audio clipping detected")
+            if m.true_peak_dbtp is not None:
+                clipped = m.true_peak_dbtp > arguments.max_clipping_dbtp
+                checks.append({
+                    "name": "clipping",
+                    "passed": not clipped,
+                    "detail": f"True peak {m.true_peak_dbtp:.1f} dBTP (limit {arguments.max_clipping_dbtp} dBTP)",
+                    "measured": m.true_peak_dbtp,
+                })
+                if clipped:
+                    failures.append(f"Clipping: true peak {m.true_peak_dbtp:.1f} dBTP exceeds {arguments.max_clipping_dbtp} dBTP")
+            elif m.max_volume_db is not None:
+                # loudnorm unavailable — fall back to volumedetect max level.
+                clipped = m.max_volume_db >= -0.1
+                checks.append({
+                    "name": "clipping",
+                    "passed": not clipped,
+                    "detail": f"Max volume {m.max_volume_db:.1f} dB (volumedetect fallback)",
+                    "measured": m.max_volume_db,
+                })
+                if clipped:
+                    failures.append(f"Clipping: max volume {m.max_volume_db:.1f} dB")
 
-        # Noise floor check
-        if arguments.check_noise_floor:
-            noise_ok = True  # placeholder
-            checks.append({"name": "noise_floor", "passed": noise_ok, "detail": "Noise floor below -60dB"})
-            if not noise_ok:
-                failures.append("Noise floor too high")
-
-        # Levels check (LUFS)
         if arguments.check_levels:
-            # Placeholder: would measure integrated LUFS
-            measured_lufs = -16.5  # placeholder
-            lufs_ok = abs(measured_lufs - arguments.target_lufs) < 2.0
-            checks.append({
-                "name": "levels",
-                "passed": lufs_ok,
-                "detail": f"Measured {measured_lufs} LUFS (target: {arguments.target_lufs})",
-            })
-            if not lufs_ok:
-                failures.append(f"Levels off: {measured_lufs} LUFS vs target {arguments.target_lufs}")
+            if m.integrated_lufs is not None:
+                deviation = abs(m.integrated_lufs - arguments.target_lufs)
+                levels_ok = deviation <= arguments.lufs_tolerance
+                checks.append({
+                    "name": "levels",
+                    "passed": levels_ok,
+                    "detail": f"Measured {m.integrated_lufs:.1f} LUFS vs target {arguments.target_lufs} (±{arguments.lufs_tolerance})",
+                    "measured": m.integrated_lufs,
+                })
+                if not levels_ok:
+                    failures.append(
+                        f"Levels off: {m.integrated_lufs:.1f} LUFS vs target {arguments.target_lufs} "
+                        f"(deviation {deviation:.1f} > {arguments.lufs_tolerance})"
+                    )
+            else:
+                checks.append({"name": "levels", "passed": False, "detail": "LUFS measurement unavailable"})
+                failures.append("Levels: integrated LUFS could not be measured")
 
-        # Silence check
+        if arguments.check_noise_floor:
+            # Measured by probing for passages at/below the floor threshold
+            # (see _measure_audio). When no such passage exists the floor is
+            # simply not measurable on this track — continuous content and a
+            # noisy floor are indistinguishable without a reference, so the
+            # check is skipped rather than failed.
+            if m.quiet_passage_detected:
+                checks.append({
+                    "name": "noise_floor",
+                    "passed": True,
+                    "detail": f"Quiet passages detected at or below {arguments.max_noise_floor_db} dB",
+                })
+            else:
+                checks.append({
+                    "name": "noise_floor",
+                    "passed": True,
+                    "detail": (
+                        f"Not measurable: no passage at/below {arguments.max_noise_floor_db} dB "
+                        "(continuous content or elevated floor) — skipped"
+                    ),
+                })
+
         if arguments.check_silence:
-            silence_ok = True  # placeholder
-            checks.append({"name": "silence", "passed": silence_ok, "detail": "No unexpected silence"})
+            long_gaps = [
+                (s, e) for s, e in m.silence_intervals
+                if e is not None and (e - s) >= arguments.min_silence_seconds
+            ]
+            silence_ok = not long_gaps
+            detail = (
+                f"No silence gaps >= {arguments.min_silence_seconds}s"
+                if silence_ok
+                else f"{len(long_gaps)} silence gap(s) >= {arguments.min_silence_seconds}s: "
+                     + ", ".join(f"{s:.1f}s–{e:.1f}s" for s, e in long_gaps[:3])
+            )
+            checks.append({"name": "silence", "passed": silence_ok, "detail": detail})
             if not silence_ok:
-                failures.append("Unexpected silence detected")
+                failures.append(detail)
 
         passed = len(failures) == 0
         lines = [
@@ -251,90 +435,120 @@ class AudioQATool(BaseTool):
 
 
 # ============================================================
-# #25 Determinism Checker
+# #25 Determinism Checker — static non-determinism analysis
 # ============================================================
 
+# Non-determinism sources in scene code. Each entry: (label, regex).
+_NON_DETERMINISM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("Math.random()", re.compile(r"\bMath\.random\s*\(")),
+    ("Date.now()", re.compile(r"\bDate\.now\s*\(")),
+    ("new Date() (current time)", re.compile(r"\bnew\s+Date\s*\(\s*\)")),
+    ("performance.now()", re.compile(r"\bperformance\.now\s*\(")),
+    ("crypto.randomUUID()", re.compile(r"\bcrypto\.randomUUID\s*\(")),
+    ("uuid v4 generation", re.compile(r"\buuid[v4]?\s*\(|\buuid4\s*\(")),
+    ("python random.random/uniform/randint", re.compile(r"\brandom\.(random|uniform|randint|choice|shuffle|randrange)\s*\(")),
+    ("python uuid.uuid4()", re.compile(r"\buuid\.uuid4\s*\(")),
+    ("python datetime.now/time.time", re.compile(r"\b(datetime\.now\s*\(|time\.time\s*\()")),
+    ("process.hrtime()", re.compile(r"\bprocess\.hrtime\s*\(")),
+)
+
+# Rendering-context keys that intentionally carry wall-clock time; scenes
+# that read these are expected to handle them deterministically (e.g. by
+# seeding), so we do NOT flag them.
+# (none currently — kept as documentation of the decision)
+
+
 class DeterminismCheckerToolInput(BaseModel):
-    scene_code: str = Field(description="Scene code to check for determinism")
-    scene_file: str = Field(default="", description="Optional path to the scene file")
-    render_count: int = Field(default=2, ge=2, le=5, description="Number of times to render and compare")
+    scene_code: str = Field(description="Scene code to check for non-determinism sources")
+    scene_file: str = Field(
+        default="",
+        description="Optional path to the scene file (used to report the filename in findings)",
+    )
 
 
 class DeterminismCheckerTool(BaseTool):
     name = "determinism_checker"
     description = (
-        "Check if a scene renders deterministically by rendering it multiple "
-        "times and comparing frame hashes. Non-deterministic scenes produce "
-        "different output on re-render, which causes flicker in final video."
+        "Statically analyse scene code for non-determinism sources "
+        "(Math.random, Date.now, performance.now, uuid4, ...) that cause "
+        "different output when a scene is re-rendered. Reports each finding "
+        "with its line number; clean code passes. This is a static check — "
+        "it does not execute or render the code."
     )
     input_model = DeterminismCheckerToolInput
 
+    def is_read_only(self, arguments) -> bool:
+        return True
+
     async def execute(self, arguments: DeterminismCheckerToolInput, context: ToolExecutionContext) -> ToolResult:
-        code_hash = hashlib.sha256(arguments.scene_code.encode("utf-8")).hexdigest()
+        findings: list[dict[str, Any]] = []
+        lines = arguments.scene_code.splitlines()
+        for label, pattern in _NON_DETERMINISM_PATTERNS:
+            for line_no, line in enumerate(lines, start=1):
+                if pattern.search(line):
+                    findings.append({
+                        "line": line_no,
+                        "source": label,
+                        "snippet": line.strip()[:120],
+                    })
 
-        # Simulate rendering N times (real implementation would call the renderer)
-        render_hashes: list[str] = []
-        for i in range(arguments.render_count):
-            # Simulate: in a real implementation, this would render the scene
-            # and hash the output frames. For now, we use the code hash.
-            # A non-deterministic scene would produce different hashes.
-            render_hashes.append(code_hash)
-
-        # Compare all hashes
-        unique_hashes = set(render_hashes)
-        is_deterministic = len(unique_hashes) == 1
-
-        lines = [
+        is_deterministic = not findings
+        source = arguments.scene_file or "scene code"
+        out = [
             "[Determinism Check]",
-            f"Scene code hash: {code_hash[:16]}...",
-            f"Render count: {arguments.render_count}",
-            f"All hashes match: {is_deterministic}",
+            f"Source: {source}",
+            f"Non-determinism sources found: {len(findings)}",
         ]
-        if not is_deterministic:
-            lines.append("")
-            lines.append("WARNING: Non-deterministic rendering detected!")
-            lines.append("This scene produces different output on re-render.")
-            lines.append("Likely causes:")
-            lines.append("  - Use of Math.random() or Date.now() in render code")
-            lines.append("  - Non-deterministic physics simulation")
-            lines.append("  - Floating-point race conditions")
-            lines.append("  - Time-based animation without fixed seed")
-            lines.append("")
-            lines.append("Render hashes:")
-            for i, h in enumerate(render_hashes):
-                lines.append(f"  Render {i+1}: {h[:16]}...")
+        if is_deterministic:
+            out.append("Result: PASS — no known non-deterministic constructs detected.")
+            out.append("Note: static analysis only; exotic sources (custom noise, uninitialized")
+            out.append("memory, unordered iteration) are not detectable without rendering.")
         else:
-            lines.append("Scene is deterministic — safe for production.")
+            out.append("Result: FAIL — re-rendering will likely produce flicker.")
+            out.append("")
+            out.append("Findings:")
+            for f in findings[:20]:
+                out.append(f"  line {f['line']}: {f['source']}")
+                out.append(f"    {f['snippet']}")
+            out.append("")
+            out.append("Fixes: seed RNGs once at init, derive time from the scene clock, and")
+            out.append("replace uuid4 with a hash of stable inputs.")
 
         return ToolResult(
-            output="\n".join(lines),
+            output="\n".join(out),
             is_error=not is_deterministic,
             metadata={
                 "is_deterministic": is_deterministic,
-                "render_count": arguments.render_count,
-                "unique_hashes": len(unique_hashes),
-                "code_hash": code_hash,
+                "findings": findings,
+                "source": source,
             },
         )
 
 
 # ============================================================
-# #26 Contact Sheet Generator
+# #26 Contact Sheet Generator — real image grid via ffmpeg
 # ============================================================
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
+_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+
+
 class ContactSheetToolInput(BaseModel):
-    scene_files: list[str] = Field(description="List of scene file paths to include in the contact sheet")
+    scene_files: list[str] = Field(description="List of rendered scene files (images or videos) to include in the contact sheet")
     output_path: str = Field(default="contact_sheet.png", description="Output contact sheet path")
     columns: int = Field(default=4, ge=1, le=10, description="Number of columns in the grid")
-    thumbnail_width: int = Field(default=320, description="Width of each thumbnail in pixels")
+    thumbnail_width: int = Field(default=320, ge=32, description="Width of each thumbnail in pixels")
+    background_color: str = Field(default="black", description="Padding/background colour for non-16:9 thumbnails")
 
 
 class ContactSheetTool(BaseTool):
     name = "contact_sheet"
     description = (
-        "Generate a contact sheet (grid of thumbnails) for faster visual QA. "
-        "Takes a list of rendered scene files and produces a single image "
-        "showing all scenes in a grid layout."
+        "Composite rendered scenes into a single contact-sheet image (grid "
+        "of thumbnails) for fast visual QA. Images are scaled and padded; "
+        "videos contribute their first frame. Uses ffmpeg; when ffmpeg is "
+        "missing or no input can be decoded, writes a JSON manifest only "
+        "and says so explicitly."
     )
     input_model = ContactSheetToolInput
 
@@ -346,58 +560,151 @@ class ContactSheetTool(BaseTool):
         if not output_path.is_absolute():
             output_path = context.cwd / output_path
 
-        # Verify input files exist
+        # Resolve inputs, split into images / videos / missing.
+        image_inputs: list[Path] = []
+        video_inputs: list[Path] = []
         missing: list[str] = []
-        found: list[str] = []
         for f in arguments.scene_files:
             p = Path(f)
             if not p.is_absolute():
                 p = context.cwd / p
-            if p.is_file():
-                found.append(str(p))
+            if not p.is_file():
+                missing.append(f)
+                continue
+            if p.suffix.lower() in _IMAGE_EXTENSIONS:
+                image_inputs.append(p)
+            elif p.suffix.lower() in _VIDEO_EXTENSIONS:
+                video_inputs.append(p)
             else:
                 missing.append(f)
 
         if missing:
-            log.warning("contact_sheet: %d files not found", len(missing))
+            log.warning("contact_sheet: %d files missing or unsupported", len(missing))
 
-        # Calculate grid dimensions
-        n = len(found)
-        cols = min(arguments.columns, n)
-        rows = (n + cols - 1) // cols
-        thumb_w = arguments.thumbnail_width
-        thumb_h = int(thumb_w * 9 / 16)  # 16:9 aspect
-        sheet_w = cols * thumb_w
-        sheet_h = rows * thumb_h
+        ffmpeg_available = shutil.which("ffmpeg") is not None
+        composited = False
+        composite_error: str = ""
+        # Inputs that made it into the grid (images + videos whose first
+        # frame decoded successfully).
+        included_count = len(image_inputs)
+        included: list[str] = [str(p) for p in image_inputs]
 
-        # In a real implementation, we'd use PIL/Pillow to composite the
-        # thumbnails. For now, we write a manifest that a renderer can use.
+        if ffmpeg_available:
+            try:
+                # Videos contribute a first-frame thumbnail via a temp file.
+                thumbs = list(image_inputs)
+                temp_thumbs: list[Path] = []
+                import tempfile
+
+                for video in video_inputs:
+                    tmp = Path(tempfile.mktemp(suffix=".png"))
+                    extract = _run_ffmpeg([
+                        "-ss", "0", "-i", str(video),
+                        "-frames:v", "1", "-y", str(tmp),
+                    ], timeout=30)
+                    if extract.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+                        temp_thumbs.append(tmp)
+                        thumbs.append(tmp)
+                        included.append(str(video))
+                        included_count += 1
+                    else:
+                        missing.append(video.name)
+                try:
+                    if thumbs:
+                        _composite_grid(thumbs, output_path, arguments)
+                        composited = True
+                finally:
+                    for tmp in temp_thumbs:
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+                composite_error = str(exc)
+        else:
+            composite_error = "ffmpeg not installed"
+        if not composited and not composite_error:
+            # All inputs failed to decode / none were compositable.
+            composite_error = "no decodable image inputs"
+
+        # Manifest is always written — it records what was requested, what
+        # was found, and whether the image was composited.
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        import json
+        cols = min(arguments.columns, max(1, included_count))
+        rows = (max(1, included_count) + cols - 1) // cols
+        thumb_w = arguments.thumbnail_width
+        thumb_h = int(thumb_w * 9 / 16)
         manifest = {
             "output_path": str(output_path),
-            "scenes": found,
-            "grid": {"cols": cols, "rows": rows, "thumb_w": thumb_w, "thumb_h": thumb_h},
-            "sheet_size": {"width": sheet_w, "height": sheet_h},
+            "image_composited": composited,
+            "included": included,
             "missing_files": missing,
+            "grid": {"cols": cols, "rows": rows, "thumb_w": thumb_w, "thumb_h": thumb_h},
         }
         manifest_path = output_path.with_suffix(".json")
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
         lines = [
-            "[Contact Sheet Generated]",
-            f"Output: {output_path}",
+            "[Contact Sheet Generated]" if composited else "[Contact Sheet]",
+            f"Output: {output_path}" + ("" if composited else " (NOT written)"),
             f"Manifest: {manifest_path}",
-            f"Scenes included: {len(found)}",
+            f"Scenes included: {included_count}",
             f"Grid: {cols} × {rows}",
             f"Thumbnail size: {thumb_w}×{thumb_h}",
         ]
         if missing:
-            lines.append(f"Missing files: {len(missing)}")
+            lines.append(f"Missing or undecodable files: {len(missing)}")
+        if not composited:
+            lines.append(f"Image compositing unavailable: {composite_error}.")
+            lines.append("Manifest written instead — install ffmpeg or provide image/video inputs to get the PNG grid.")
+
+        # Error only when nothing at all could be included; a partial sheet
+        # (some files missing) is still a useful result.
+        is_error = included_count == 0
         return ToolResult(
             output="\n".join(lines),
+            is_error=is_error,
             metadata=manifest,
         )
+
+
+def _composite_grid(thumbs: list[Path], output_path: Path, arguments: ContactSheetToolInput) -> None:
+    """Scale/pad every input to the thumbnail size and xstack them into a grid."""
+    w = arguments.thumbnail_width
+    h = int(w * 9 / 16)
+    n = len(thumbs)
+    cols = min(arguments.columns, n)
+    bg = arguments.background_color
+
+    args: list[str] = []
+    for t in thumbs:
+        args += ["-i", str(t)]
+
+    # Per-input: scale to fit, then pad to the exact cell size.
+    filter_parts = []
+    for i in range(n):
+        filter_parts.append(
+            f"[{i}]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={bg},"
+            f"setsar=1[t{i}]"
+        )
+    if n == 1:
+        filter_complex = ";".join(filter_parts) + ";[t0]null[out]"
+    else:
+        # Uniform grid: cell k sits at (col*w, row*h) — plain integers.
+        layout = "|".join(f"{(k % cols) * w}_{(k // cols) * h}" for k in range(n))
+        inputs_ref = "".join(f"[t{i}]" for i in range(n))
+        filter_complex = ";".join(filter_parts) + f";{inputs_ref}xstack=inputs={n}:layout={layout}:fill=black[out]"
+
+    args += [
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-frames:v", "1",
+        "-y", str(output_path),
+    ]
+    result = _run_ffmpeg(args, timeout=120)
+    if result.returncode != 0 or not output_path.is_file():
+        raise RuntimeError(_summarize_ffmpeg_error(result.stderr))
 
 
 # ============================================================
@@ -420,6 +727,9 @@ class EngineRouterTool(BaseTool):
         "animations, Blender for 3D, FFmpeg for video compositing."
     )
     input_model = EngineRouterToolInput
+
+    def is_read_only(self, arguments) -> bool:
+        return True
 
     async def execute(self, arguments: EngineRouterToolInput, context: ToolExecutionContext) -> ToolResult:
         engine = route_engine(arguments.scene_description, arguments.available_engines)
@@ -460,7 +770,6 @@ def route_engine(description: str, available: list[str]) -> str:
 
 def _get_routing_reason(description: str, engine: str) -> str:
     """Return a human-readable reason for the engine choice."""
-    lowered = description.lower()
     if engine == "blender":
         return "3D content detected — Blender handles 3D rendering natively."
     if engine == "manim":

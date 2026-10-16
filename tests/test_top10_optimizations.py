@@ -16,8 +16,6 @@ import pytest
 # Optimization #5: auto_compact_threshold_ratio
 from openharness.services.compact import (
     get_autocompact_threshold,
-    should_autocompact,
-    AutoCompactState,
 )
 
 
@@ -64,7 +62,7 @@ def test_optimization_5_explicit_tokens_overrides_ratio():
 # Optimization #6: trusted_project
 from openharness.config.settings import PermissionSettings, Settings
 from openharness.permissions.modes import PermissionMode
-from openharness.permissions.checker import PermissionChecker, build_permission_checker
+from openharness.permissions.checker import build_permission_checker
 
 
 def test_optimization_6_trusted_project_auto_approves_in_project_file():
@@ -126,7 +124,6 @@ def test_optimization_6_disabled_by_default():
 # Optimization #7: tool result cache
 from openharness.services.tool_cache import (
     ToolResultCache,
-    enable_tool_cache,
     disable_tool_cache,
     get_tool_cache,
     configure_tool_cache_from_settings,
@@ -216,11 +213,9 @@ def test_optimization_7_disabled_by_default():
 # Optimization #3: auto context injection
 from openharness.services.auto_context import (
     DEFAULT_AUTO_CONTEXT_FILES,
-    build_auto_context_prefix,
     discover_auto_context_files,
     inject_auto_context,
     is_auto_context_enabled,
-    get_auto_context_files,
 )
 
 
@@ -357,11 +352,8 @@ def test_optimization_1_with_agent_limit_releases_on_exception():
 from openharness.services.provider_routing import (
     RoutedStreamingClient,
     ProviderRoute,
-    RoutingStats,
 )
-from openharness.api.client import ApiMessageRequest, ApiTextDeltaEvent, ApiMessageCompleteEvent
-from openharness.api.usage import UsageSnapshot
-from openharness.engine.messages import ConversationMessage, TextBlock
+from openharness.api.client import ApiMessageRequest, ApiTextDeltaEvent
 
 
 class _FakeClient:
@@ -522,7 +514,6 @@ def test_optimization_10_auto_save_writes_snapshot(tmp_path: Path, monkeypatch):
     """Item 10: QueryEngine._auto_save_session writes latest.json on turn end."""
     from openharness.engine.query_engine import QueryEngine
     from openharness.engine.messages import ConversationMessage, TextBlock
-    from openharness.api.usage import UsageSnapshot
     from openharness.config.settings import Settings
     from openharness.config.paths import get_sessions_dir
     # Point sessions dir at tmp_path so we can inspect the snapshot.
@@ -553,7 +544,6 @@ def test_optimization_10_auto_save_writes_snapshot(tmp_path: Path, monkeypatch):
     engine._auto_save_session()
     # Snapshot should be written to the project session dir
     session_dir = get_sessions_dir()
-    latest = session_dir / "test-123-latest.json"  # the project name + hash format
     # Find any latest.json written under sessions dir
     latest_files = list(session_dir.rglob("latest.json"))
     assert latest_files, "auto_save should have written a latest.json snapshot"

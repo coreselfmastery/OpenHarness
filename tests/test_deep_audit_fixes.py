@@ -7,19 +7,15 @@ fix works in the real code path.
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
-from openharness.api.client import ApiMessageRequest, ApiMessageCompleteEvent, ApiTextDeltaEvent
+from openharness.api.client import ApiMessageRequest, ApiTextDeltaEvent
 from openharness.api.errors import RateLimitFailure
-from openharness.api.usage import UsageSnapshot
 from openharness.config.settings import Settings
-from openharness.engine.messages import ConversationMessage, TextBlock
-from openharness.services.tool_cache import ToolResultCache, enable_tool_cache, reset_tool_cache, disable_tool_cache
+from openharness.services.tool_cache import ToolResultCache
 
 
 # ============================================================
@@ -36,7 +32,6 @@ async def test_bug_1_acquire_permit_holds_until_completion_listener_fires():
         acquire_permit_for_task,
         configure_agent_concurrency,
         get_agent_semaphore,
-        reset_agent_concurrency,
     )
 
     settings = Settings(max_concurrent_agents=2)
@@ -78,7 +73,7 @@ async def test_bug_1_acquire_permit_holds_until_completion_listener_fires():
 
     # Acquire both permits first so we can verify the spawn holds one
     await sem.acquire()  # permit 1 held by us
-    record = await acquire_permit_for_task(_do_spawn, task_manager=tm)
+    await acquire_permit_for_task(_do_spawn, task_manager=tm)
     # Now the spawn holds permit 2. Trying to acquire a third should block.
     third_acquired = False
 
@@ -108,7 +103,6 @@ async def test_bug_1_permit_released_on_spawn_failure():
         acquire_permit_for_task,
         configure_agent_concurrency,
         get_agent_semaphore,
-        reset_agent_concurrency,
     )
 
     settings = Settings(max_concurrent_agents=1)
@@ -133,7 +127,6 @@ async def test_bug_1_permit_released_on_already_completed_task():
         acquire_permit_for_task,
         configure_agent_concurrency,
         get_agent_semaphore,
-        reset_agent_concurrency,
     )
 
     settings = Settings(max_concurrent_agents=1)
@@ -362,7 +355,6 @@ def test_bug_5_thinking_budget_above_max_clamped_down():
 
 def test_bug_5_thinking_budget_skipped_when_max_tokens_too_small():
     """Bug #5: when max_tokens < 1025, thinking is skipped (can't satisfy minimum 1024)."""
-    request_thinking_budget = 4096
     request_max_tokens = 1024  # max_allowed = 1023 < min_budget = 1024
     min_budget = 1024
     max_allowed = request_max_tokens - 1  # = 1023
@@ -413,7 +405,7 @@ def test_bug_6_kaggle_defaults_respect_explicit_user_value():
 def test_bug_6_kaggle_defaults_fill_in_unset_values():
     """Bug #6: when user did NOT set max_concurrent_agents (None), Kaggle
     auto-detection fills in a hardware-aware value."""
-    from openharness.services.kaggle_env import apply_kaggle_defaults_to_settings, detect_kaggle_resources
+    from openharness.services.kaggle_env import apply_kaggle_defaults_to_settings
 
     import os
     old_kaggle = os.environ.get("KAGGLE_KERNEL_RUN_TYPE")

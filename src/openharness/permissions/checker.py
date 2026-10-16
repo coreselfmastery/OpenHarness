@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import os
 from dataclasses import dataclass
 
 from openharness.config.settings import PermissionSettings
@@ -182,11 +183,25 @@ class PermissionChecker:
 
 
 def _path_is_inside(path: str, root: str) -> bool:
-    """Return True if ``path`` is the same as or inside ``root``."""
-    normalized = path.rstrip("/")
-    if normalized == root:
+    """Return True if ``path`` is the same as or inside ``root``.
+
+    Both paths are resolved to their canonical absolute form first, so
+    traversal attempts like ``/project/../../etc/passwd`` cannot pass the
+    prefix check by merely *starting* with the project directory.
+    """
+    try:
+        resolved = os.path.realpath(path)
+    except (OSError, ValueError):
+        resolved = path
+    try:
+        resolved_root = os.path.realpath(root)
+    except (OSError, ValueError):
+        resolved_root = root
+    normalized = resolved.rstrip("/")
+    root_norm = resolved_root.rstrip("/")
+    if normalized == root_norm:
         return True
-    return normalized.startswith(root + "/")
+    return normalized.startswith(root_norm + "/")
 
 
 def build_permission_checker(settings, *, cwd: str | None = None) -> PermissionChecker:

@@ -40,12 +40,14 @@ _CACHEABLE_TOOLS: frozenset[str] = frozenset({
 # Tools that mutate state and therefore invalidate the cache when called.
 # We invalidate the *entire* cache because the mutation could affect any
 # cached path (e.g. ``write_file("a.py", ...)`` invalidates ``grep`` results
-# that include ``a.py``).
+# that include ``a.py``). ``bash`` invalidates on *every* call, successful
+# or not — a successful ``rm``/``mv`` mutates just as much as a failing one,
+# so returncode-based filtering would be unsound.
 _MUTATING_TOOLS: frozenset[str] = frozenset({
     "write_file",
     "edit_file",
     "notebook_edit",
-    "bash",  # bash may mutate; we invalidate only on non-zero returncode
+    "bash",
     "todo_write",
 })
 
@@ -66,6 +68,10 @@ class ToolResultCache:
         self._hits = 0
         self._misses = 0
         self._invalidations = 0
+        # Monotonic generation counter. Bumped on every invalidate_all so
+        # in-flight executions that started before a mutation can detect
+        # that their result is stale and must not be cached.
+        self._generation = 0
         # In-flight execution tracker: when two coroutines request the
         # same cache key concurrently, only the first executes the tool;
         # the second awaits the same future. Prevents thundering-herd
@@ -155,8 +161,11 @@ class ToolResultCache:
         if self._entries:
             self._invalidations += len(self._entries)
             self._entries.clear()
-        # Also cancel any in-flight executions — their results would be
-        # stale because the filesystem may have changed.
+        # Bump the generation so in-flight executions (started before the
+        # mutation) know not to cache their now-stale results. The futures
+        # themselves are left alone — their awaiters still get a result,
+        # it just won't be persisted.
+        self._generation += 1
         self._in_flight.clear()
 
     def stats(self) -> dict[str, int]:
@@ -229,8 +238,9 @@ class ToolResultCache:
 
         # We're the first coroutine. Create a future so concurrent
         # callers can await our result.
-        future: "asyncio.Future[dict[str, Any] | None]" = asyncio.get_event_loop().create_future()
+        future: "asyncio.Future[dict[str, Any] | None]" = asyncio.get_running_loop().create_future()
         self._in_flight[key] = future
+        generation = self._generation
         try:
             try:
                 result = await executor()
@@ -241,7 +251,11 @@ class ToolResultCache:
                 self._in_flight.pop(key, None)
                 raise
             if isinstance(result, dict) and not result.get("is_error"):
-                self.put(tool_name, tool_input, result)
+                # Only cache if no mutation invalidated the cache while the
+                # executor was running — otherwise we'd persist a result
+                # computed against pre-mutation filesystem state.
+                if self._generation == generation:
+                    self.put(tool_name, tool_input, result)
             future.set_result(result if isinstance(result, dict) else None)
             return result if isinstance(result, dict) else None
         finally:

@@ -35,7 +35,7 @@ from openharness.hooks import HookEvent, HookExecutionContext, HookExecutor, loa
 from openharness.hooks.hot_reload import HookReloader
 from openharness.mcp.client import McpClientManager
 from openharness.mcp.config import load_mcp_server_configs
-from openharness.permissions import PermissionChecker, build_permission_checker
+from openharness.permissions import build_permission_checker
 from openharness.plugins import load_plugins
 from openharness.prompts import build_runtime_system_prompt
 from openharness.state import AppState, AppStateStore
@@ -345,7 +345,10 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
                 if not isinstance(fallback_cfg, dict):
                     continue
                 name = fallback_cfg.get("name") or f"fallback_{len(fallback_routes) + 1}"
-                route = _build_fallback_route(name, fallback_cfg)
+                # Shared route builder lives in provider_routing so there
+                # is exactly one implementation of the config shape.
+                from openharness.services.provider_routing import build_fallback_route
+                route = build_fallback_route(name, fallback_cfg)
                 if route is not None:
                     fallback_routes.append(route)
             if fallback_routes:
@@ -363,31 +366,6 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             pass
 
     return primary
-
-
-def _build_fallback_route(name: str, cfg: dict) -> "ProviderRoute | None":
-    """Construct a fallback ProviderRoute from a routing config dict.
-
-    Config shape: ``{"provider": "openai_compat", "api_format": "openai",
-    "base_url": "...", "api_key": "...", "delay_seconds": 0.0}``.
-    """
-    from openharness.services.provider_routing import ProviderRoute
-    from openharness.api.openai_client import OpenAICompatibleClient
-    from openharness.api.client import AnthropicApiClient
-
-    api_format = (cfg.get("api_format") or "openai").strip().lower()
-    api_key = cfg.get("api_key") or cfg.get("auth_token") or ""
-    base_url = cfg.get("base_url")
-    if not api_key:
-        return None
-    delay = float(cfg.get("delay_seconds", 0.0) or 0.0)
-    if api_format in ("openai", "openai_compat"):
-        client = OpenAICompatibleClient(api_key=api_key, base_url=base_url)
-    elif api_format == "anthropic":
-        client = AnthropicApiClient(api_key=api_key, base_url=base_url)
-    else:
-        return None
-    return ProviderRoute(name=name, client=client, delay_seconds=delay)
 
 
 def _print_auth_resolution_error(settings, exc: Exception) -> None:
@@ -796,7 +774,7 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
         )
     bundle.engine.set_model(settings.model)
     bundle.engine.set_effort(settings.effort)
-    bundle.engine.set_permission_checker(build_permission_checker(settings, cwd=str(bundle.engine._cwd)))
+    bundle.engine.set_permission_checker(build_permission_checker(settings, cwd=str(bundle.engine.cwd)))
     system_prompt = build_runtime_system_prompt(
         settings,
         cwd=bundle.cwd,

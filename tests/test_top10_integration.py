@@ -7,17 +7,13 @@ full query loop, not just the individual modules.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
 from openharness.api.client import (
     ApiMessageCompleteEvent,
     ApiMessageRequest,
-    ApiStreamEvent,
     ApiTextDeltaEvent,
 )
 from openharness.api.usage import UsageSnapshot
@@ -25,7 +21,7 @@ from openharness.config.settings import (
     PermissionSettings,
     Settings,
 )
-from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock, ToolResultBlock
+from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock
 from openharness.engine.query_engine import QueryEngine
 from openharness.engine.stream_events import ToolExecutionCompleted
 from openharness.permissions.checker import build_permission_checker
@@ -37,7 +33,7 @@ from openharness.services.tool_cache import (
     get_tool_cache,
 )
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
-from openharness.tools.file_read_tool import FileReadTool, FileReadToolInput
+from openharness.tools.file_read_tool import FileReadToolInput
 from pydantic import BaseModel, Field
 
 
@@ -258,8 +254,10 @@ async def test_tool_cache_invalidated_after_write_file(tmp_path: Path):
             settings=settings,
             api_messages=api_messages,
         )
-        events_1 = [event async for event in engine.submit_message("read")]
-        events_2 = [event async for event in engine.submit_message("write")]
+        # Drive the first two turns; only the third turn's events are asserted on.
+        for message in ("read", "write"):
+            async for _ in engine.submit_message(message):
+                pass
         events_3 = [event async for event in engine.submit_message("read again")]
         # First read: 1 execution (cache miss)
         # Write: invalidates cache
@@ -330,7 +328,8 @@ async def test_parallel_tools_runs_independent_tools_concurrently(tmp_path: Path
         api_messages=api_messages,
     )
     t0 = time.monotonic()
-    events = [event async for event in engine.submit_message("run two")]
+    async for _ in engine.submit_message("run two"):
+        pass
     elapsed = time.monotonic() - t0
     # If parallel: 0.2s total (both run at once).
     # If sequential: 0.4s total.

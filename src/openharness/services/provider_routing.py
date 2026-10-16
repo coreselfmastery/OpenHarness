@@ -27,15 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from openharness.api.client import (
-    ApiMessageCompleteEvent,
     ApiMessageRequest,
     ApiRetryEvent,
     ApiStreamEvent,
-    ApiTextDeltaEvent,
     SupportsStreamingMessages,
 )
 from openharness.api.errors import OpenHarnessApiError, RateLimitFailure, RequestFailure
@@ -52,9 +50,6 @@ class ProviderRoute:
     # When this route's request fails, wait this long before trying the
     # next fallback. Default 0 means immediate fallback (no delay).
     delay_seconds: float = 0.0
-    # When True, only use this route for the Nth attempt onward. Used to
-    # skip slow providers on the first try.
-    min_attempt: int = 1
 
 
 @dataclass
@@ -176,47 +171,17 @@ class RoutedStreamingClient(SupportsStreamingMessages):
             raise last_error
 
 
-def build_routed_client_from_settings(settings: Any) -> RoutedStreamingClient | None:
-    """Build a RoutedStreamingClient from ``settings.provider_routing``.
+def build_fallback_route(name: str, cfg: dict[str, Any]) -> ProviderRoute | None:
+    """Construct a fallback ProviderRoute from a routing config dict.
 
-    Returns ``None`` when routing is not configured (single-provider
-    mode). When routing is configured but a fallback client fails to
-    construct, that fallback is skipped with a warning so the primary
-    still works.
-    """
-    routing_config = getattr(settings, "provider_routing", None)
-    if not routing_config:
-        return None
-    if not isinstance(routing_config, dict):
-        log.warning("provider_routing must be a dict, got %r", type(routing_config))
-        return None
-    primary_cfg = routing_config.get("primary")
-    if not primary_cfg:
-        return None
-    routes: list[ProviderRoute] = []
-    primary = _build_route_from_config("primary", primary_cfg)
-    if primary is None:
-        return None
-    routes.append(primary)
-    for fallback_cfg in routing_config.get("fallbacks", []):
-        if not isinstance(fallback_cfg, dict):
-            continue
-        name = fallback_cfg.get("name") or f"fallback_{len(routes)}"
-        route = _build_route_from_config(name, fallback_cfg)
-        if route is not None:
-            routes.append(route)
-    if len(routes) == 1:
-        return None  # No fallbacks configured — no routing needed.
-    return RoutedStreamingClient(*routes)
+    Config shape: ``{"api_format": "openai", "base_url": "...",
+    "api_key": "...", "delay_seconds": 0.0}`` (``auth_token`` is
+    accepted as an alias for ``api_key``). Returns ``None`` when the
+    config is unusable (no API key, unsupported api_format) so callers
+    can skip that fallback and keep the rest of the chain.
 
-
-def _build_route_from_config(name: str, cfg: dict[str, Any]) -> ProviderRoute | None:
-    """Construct a ProviderRoute from a config dict.
-
-    The config shape mirrors ``ProviderProfile`` so users can copy a
-    profile into the routing list:
-        {"provider": "openai_compat", "api_format": "openai",
-         "base_url": "...", "api_key": "...", "model": "..."}
+    This is the single route-building implementation used by the runtime
+    when wiring ``settings.provider_routing`` fallbacks.
     """
     from openharness.api.openai_client import OpenAICompatibleClient
     from openharness.api.client import AnthropicApiClient
@@ -224,8 +189,6 @@ def _build_route_from_config(name: str, cfg: dict[str, Any]) -> ProviderRoute | 
     api_format = (cfg.get("api_format") or "openai").strip().lower()
     api_key = cfg.get("api_key") or cfg.get("auth_token") or ""
     base_url = cfg.get("base_url")
-    model = cfg.get("model")  # Used for logging only — the actual model
-                              # comes from the ApiMessageRequest.
     if not api_key:
         log.warning("route %s has no api_key; skipping", name)
         return None

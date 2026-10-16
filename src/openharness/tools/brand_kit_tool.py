@@ -278,7 +278,6 @@ def check_brand_compliance(scene_code: str, brand: BrandConfig) -> BrandComplian
     - Fonts match brand.heading / brand.body.
     - min_type_size is respected (no font-size below the minimum).
     - safe_area is respected (no elements outside the safe area).
-    - Easing curve matches brand.easing (if specified in code).
     """
     checks: list[dict[str, Any]] = []
     failures: list[str] = []
@@ -593,11 +592,11 @@ class BrandKitTool(BaseTool):
         brand = BrandConfig.from_yaml_file(brand_path)
 
         if arguments.action == "drift":
-            return self._handle_drift(arguments, brand, context)
+            return self._handle_drift(arguments, brand)
         elif arguments.action == "validate":
             return self._handle_validate(arguments, brand)
         elif arguments.action == "score":
-            return self._handle_score(arguments, brand, context)
+            return self._handle_score(arguments, brand)
         else:
             return ToolResult(
                 output=f"Unknown action: {arguments.action}. Use 'validate', 'drift', or 'score'.",
@@ -608,7 +607,6 @@ class BrandKitTool(BaseTool):
         self,
         arguments: BrandKitToolInput,
         brand: BrandConfig,
-        context: ToolExecutionContext,
     ) -> ToolResult:
         if not arguments.project_id:
             return ToolResult(
@@ -677,7 +675,6 @@ class BrandKitTool(BaseTool):
         self,
         arguments: BrandKitToolInput,
         brand: BrandConfig,
-        context: ToolExecutionContext,
     ) -> ToolResult:
         if not arguments.scene_code:
             return ToolResult(

@@ -6,15 +6,11 @@ mock the OpenAI client so the tests run without API keys or network.
 """
 from __future__ import annotations
 
-import asyncio
-import json
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openharness.tools.base import ToolExecutionContext, ToolRegistry, ToolResult
+from openharness.tools.base import ToolExecutionContext
 
 
 # ============================================================
@@ -24,7 +20,6 @@ from openharness.tools.base import ToolExecutionContext, ToolRegistry, ToolResul
 from openharness.tools.batch_scene_tool import (
     BatchSceneTool,
     BatchSceneToolInput,
-    ParsedScene,
     parse_batch_response,
     lint_scene_code,
     build_batch_prompt,
@@ -309,8 +304,8 @@ SCENE_002:
     # Verify files were written
     scene1 = tmp_path / "scenes" / "scene_001.js"
     scene2 = tmp_path / "scenes" / "scene_002.js"
-    assert scene1.is_file(), f"scene_001.js not written"
-    assert scene2.is_file(), f"scene_002.js not written"
+    assert scene1.is_file(), "scene_001.js not written"
+    assert scene2.is_file(), "scene_002.js not written"
     assert "Hello" in scene1.read_text()
     assert "Goodbye" in scene2.read_text()
 
@@ -374,7 +369,6 @@ from openharness.tools.brand_kit_tool import (
     BrandColors,
     BrandFonts,
     generate_drift,
-    CreativeDrift,
     check_brand_compliance,
     score_creative_originality,
     _hex_to_hsl,
