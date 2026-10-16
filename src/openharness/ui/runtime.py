@@ -116,6 +116,62 @@ def _resolve_scene_gen_config(settings) -> dict[str, str]:
     }
 
 
+def _build_brand_anchor_section(cwd: str | Path) -> str | None:
+    """Load brand.yaml from the project root and build a system-prompt section.
+
+    Returns None when brand.yaml is missing (no overhead). When present,
+    returns a formatted section that lists the brand anchors (name,
+    colors, fonts, voice, music style, min type size, safe area, easing)
+    so the agent is brand-aware on every turn without needing to call
+    the brand_kit tool explicitly.
+    """
+    from pathlib import Path
+    brand_path = Path(cwd) / "brand.yaml"
+    if not brand_path.is_file():
+        return None
+    try:
+        from openharness.tools.brand_kit_tool import BrandConfig
+        brand = BrandConfig.from_yaml_file(brand_path)
+    except Exception:
+        return None  # Don't crash the session if brand.yaml is malformed.
+    if not brand.name and not brand.colors.primary and not brand.fonts.heading:
+        return None  # Empty brand config — skip.
+    lines = ["# Brand Anchors (from brand.yaml)", ""]
+    if brand.name:
+        lines.append(f"- Channel: {brand.name}")
+    if brand.colors.primary or brand.colors.secondary or brand.colors.accent:
+        lines.append("- Colors:")
+        if brand.colors.primary:
+            lines.append(f"  - Primary: {brand.colors.primary}")
+        if brand.colors.secondary:
+            lines.append(f"  - Secondary: {brand.colors.secondary}")
+        if brand.colors.accent:
+            lines.append(f"  - Accent: {brand.colors.accent}")
+    if brand.fonts.heading or brand.fonts.body:
+        lines.append("- Fonts:")
+        if brand.fonts.heading:
+            lines.append(f"  - Heading: {brand.fonts.heading}")
+        if brand.fonts.body:
+            lines.append(f"  - Body: {brand.fonts.body}")
+    if brand.voice:
+        lines.append(f"- Voice: {brand.voice}")
+    if brand.music_style:
+        lines.append(f"- Music style: {brand.music_style}")
+    if brand.min_type_size:
+        lines.append(f"- Minimum type size: {brand.min_type_size}px")
+    if brand.safe_area:
+        lines.append(f"- Safe area: {brand.safe_area}px")
+    if brand.easing:
+        lines.append(f"- Easing: {brand.easing}")
+    lines.append("")
+    lines.append(
+        "All generated scenes MUST comply with these brand anchors. "
+        "Use the `brand_kit` tool with `action=drift` to get a per-project "
+        "creative drift that stays within this envelope."
+    )
+    return "\n".join(lines)
+
+
 def _resolve_vision_config(settings) -> dict[str, str]:
     """Resolve the vision model configuration from settings or environment.
 
@@ -468,6 +524,13 @@ async def build_runtime(
         extra_plugin_roots=normalized_plugin_roots,
         include_project_memory=include_project_memory,
     )
+    # Item #2 (Brand Kit wiring): inject brand.yaml anchors into the
+    # system prompt so every turn sees the brand identity. This makes
+    # the agent brand-aware without needing to call brand_kit on every
+    # turn. The drift is generated lazily per-project, not here.
+    brand_section = _build_brand_anchor_section(cwd)
+    if brand_section:
+        system_prompt_text = f"{system_prompt_text}\n\n{brand_section}"
     from uuid import uuid4
 
     session_id = uuid4().hex[:12]
