@@ -264,7 +264,15 @@ def parse_verdict_payload(payload: str, scene_names: list[str]) -> list[QAVerdic
     raw_verdicts = data.get("verdicts")
     if not isinstance(raw_verdicts, list):
         return None
-    expected = set(scene_names)
+    # Accept the scene identified either by full filename ("scene_001.tsx")
+    # or bare stem ("scene_001") — models echo both forms and the previous
+    # one-way normalization silently failed the whole parse when the form
+    # didn't match scene_names exactly.
+    name_set = set(scene_names)
+    stem_to_name = {Path(n).stem: n for n in scene_names}
+    # Coverage is required over the CANONICAL names; stems are lookup
+    # aliases only.
+    expected = name_set
     got: set[str] = set()
     verdicts: list[QAVerdict] = []
     for raw in raw_verdicts:
@@ -273,13 +281,25 @@ def parse_verdict_payload(payload: str, scene_names: list[str]) -> list[QAVerdic
         scene = str(raw.get("scene") or "").strip()
         if not scene:
             continue
-        base = Path(scene).stem
-        name = base if base in expected else scene
+        if scene in name_set:
+            name = scene
+        elif Path(scene).stem in stem_to_name:
+            name = stem_to_name[Path(scene).stem]
+        elif scene in stem_to_name:
+            name = stem_to_name[scene]
+        else:
+            continue  # verdict for a scene we were not asked about
         got.add(name)
         try:
             score = float(raw.get("score") or 0.0)
         except (TypeError, ValueError):
             score = 0.0
+        # Models return either 0-1 or 0-100 scales. A raw "85" clamped
+        # straight into [0, 1] would become a PERFECT 1.0 — and QA scores
+        # feed the early-exit promotion threshold (0.9), so a mediocre
+        # 85/100 scene would be auto-promoted. Normalize first.
+        if score > 1.0:
+            score = score / 100.0 if score <= 100.0 else 1.0
         score = max(0.0, min(1.0, score))
         issues = [
             {
@@ -445,12 +465,30 @@ class QAReviewer:
         self._predictor = FailurePredictor(store) if store is not None else None
         self.calls_made = 0
         self.review_waves = 0
+        # One shared HTTP client for the reviewer's lifetime: connection
+        # pooling means QA waves don't pay a fresh TCP+TLS handshake per
+        # LLM call (5-10 calls per wave add up on hosted endpoints).
+        self._http: Any = None
+
+    def _http_client(self):
+        if self._http is None:
+            import httpx
+
+            self._http = httpx.AsyncClient(timeout=self._timeout)
+        return self._http
+
+    async def aclose(self) -> None:
+        """Release the shared HTTP client (call when the session ends)."""
+        if self._http is not None:
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
+            self._http = None
 
     # -- single LLM call ------------------------------------------------
 
     async def _chat(self, prompt: str) -> str:
-        import httpx
-
         url = f"{self._base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self._api_key}"}
         payload = {
@@ -460,10 +498,10 @@ class QAReviewer:
             "temperature": 0.1,
         }
         self.calls_made += 1
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        client = self._http_client()
+        response = await client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError(f"QA endpoint returned no choices: {str(data)[:200]}")
@@ -488,11 +526,15 @@ class QAReviewer:
         use_batch = self._batching and mode in {"auto", "batch"}
         if use_batch:
             # Batch simple scenes per call; complex scenes get single
-            # deep reviews (their code is long and needs focus).
+            # deep reviews (their code is long and needs focus). With
+            # smart_depth disabled, EVERY scene is batchable — previously
+            # they all fell into the "complex" bucket and batching was
+            # silently disabled even though batching=True.
             simple: list[Path] = []
             complex_scenes: list[Path] = []
             for path in scene_paths:
-                (simple if (self._smart_depth and classify_scene(path).is_simple) else complex_scenes).append(path)
+                is_simple = not self._smart_depth or classify_scene(path).is_simple
+                (simple if is_simple else complex_scenes).append(path)
             groups = [simple[i : i + self._batch_size] for i in range(0, len(simple), self._batch_size)]
             single_jobs = complex_scenes
         elif mode == "batch":

@@ -116,62 +116,6 @@ def _resolve_scene_gen_config(settings) -> dict[str, str]:
     }
 
 
-def _build_brand_anchor_section(cwd: str | Path) -> str | None:
-    """Load brand.yaml from the project root and build a system-prompt section.
-
-    Returns None when brand.yaml is missing (no overhead). When present,
-    returns a formatted section that lists the brand anchors (name,
-    colors, fonts, voice, music style, min type size, safe area, easing)
-    so the agent is brand-aware on every turn without needing to call
-    the brand_kit tool explicitly.
-    """
-    from pathlib import Path
-    brand_path = Path(cwd) / "brand.yaml"
-    if not brand_path.is_file():
-        return None
-    try:
-        from openharness.tools.brand_kit_tool import BrandConfig
-        brand = BrandConfig.from_yaml_file(brand_path)
-    except Exception:
-        return None  # Don't crash the session if brand.yaml is malformed.
-    if not brand.name and not brand.colors.primary and not brand.fonts.heading:
-        return None  # Empty brand config — skip.
-    lines = ["# Brand Anchors (from brand.yaml)", ""]
-    if brand.name:
-        lines.append(f"- Channel: {brand.name}")
-    if brand.colors.primary or brand.colors.secondary or brand.colors.accent:
-        lines.append("- Colors:")
-        if brand.colors.primary:
-            lines.append(f"  - Primary: {brand.colors.primary}")
-        if brand.colors.secondary:
-            lines.append(f"  - Secondary: {brand.colors.secondary}")
-        if brand.colors.accent:
-            lines.append(f"  - Accent: {brand.colors.accent}")
-    if brand.fonts.heading or brand.fonts.body:
-        lines.append("- Fonts:")
-        if brand.fonts.heading:
-            lines.append(f"  - Heading: {brand.fonts.heading}")
-        if brand.fonts.body:
-            lines.append(f"  - Body: {brand.fonts.body}")
-    if brand.voice:
-        lines.append(f"- Voice: {brand.voice}")
-    if brand.music_style:
-        lines.append(f"- Music style: {brand.music_style}")
-    if brand.min_type_size:
-        lines.append(f"- Minimum type size: {brand.min_type_size}px")
-    if brand.safe_area:
-        lines.append(f"- Safe area: {brand.safe_area}px")
-    if brand.easing:
-        lines.append(f"- Easing: {brand.easing}")
-    lines.append("")
-    lines.append(
-        "All generated scenes MUST comply with these brand anchors. "
-        "Use the `brand_kit` tool with `action=drift` to get a per-project "
-        "creative drift that stays within this envelope."
-    )
-    return "\n".join(lines)
-
-
 def _resolve_vision_config(settings) -> dict[str, str]:
     """Resolve the vision model configuration from settings or environment.
 
@@ -417,9 +361,32 @@ def _wrap_with_inference_pipeline(
         client_factory = None
         if inference is not None and getattr(inference, "api_key_pool", None):
             if settings.provider not in {"anthropic_claude"} and settings.api_format != "copilot":
-                client_factory = lambda api_key: _build_primary_with_overrides(settings, api_key)
+                if fallback_routes:
+                    # COMPOSITION FIX: with BOTH a key pool and provider
+                    # fallbacks, each rotated key must keep the fallback
+                    # chain intact — a bare primary per key would silently
+                    # drop fallback routing (the pool replaced the routed
+                    # wrapper with its own factory-built clients). Rebuild
+                    # a routed stack per rotated key; the fallback route
+                    # clients are shared (their keys are their own).
+                    def client_factory(api_key, _routes=fallback_routes):  # noqa: F811
+                        from openharness.services.provider_routing import (
+                            ProviderRoute,
+                            RoutedStreamingClient,
+                        )
+
+                        primary_route = ProviderRoute(
+                            name="primary",
+                            client=_build_primary_with_overrides(settings, api_key),
+                            delay_seconds=0.0,
+                        )
+                        return RoutedStreamingClient(primary_route, *_routes)
+                else:
+                    client_factory = lambda api_key: _build_primary_with_overrides(settings, api_key)
         racing_routes = [
-            (route.name, route.client) for route in fallback_routes if route.client is not None
+            (route.name, route.client, getattr(route, "model", None))
+            for route in fallback_routes
+            if route.client is not None
         ]
         return wrap_client_with_inference_pipeline(
             settings,
@@ -526,6 +493,19 @@ async def build_runtime(
     }
     settings = load_settings().merge_cli_overrides(**settings_overrides)
     cwd = str(Path(cwd).expanduser().resolve()) if cwd else str(Path.cwd())
+    # Kaggle hardware auto-detection: must run BEFORE anything snapshots
+    # settings-derived values (bootstrap_session_services, the API client,
+    # the system prompt, and especially the engine's tool_metadata, which
+    # captures max_concurrent_agents / batch_size / parallel_tools at
+    # construction time). Previously this ran AFTER the engine was built,
+    # so the auto-raised Kaggle values never reached the query loop or
+    # the spawn tools.
+    try:
+        from openharness.services.kaggle_env import apply_kaggle_defaults_to_settings
+
+        apply_kaggle_defaults_to_settings(settings)
+    except Exception:
+        pass  # Off-Kaggle or detection failed — use defaults
     normalized_skill_dirs = tuple(str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ()))
     normalized_plugin_roots = tuple(str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ()))
     plugins = load_plugins(settings, cwd, extra_roots=normalized_plugin_roots)
@@ -593,6 +573,9 @@ async def build_runtime(
         ),
     )
     engine_max_turns = settings.max_turns if (enforce_max_turns or max_turns is not None) else None
+    # Item #2 (Brand Kit wiring): brand.yaml anchors are injected inside
+    # build_runtime_system_prompt (prompts/context.py) so they survive the
+    # per-line / per-command prompt rebuilds in handle_line().
     system_prompt_text = build_runtime_system_prompt(
         settings,
         cwd=cwd,
@@ -601,13 +584,6 @@ async def build_runtime(
         extra_plugin_roots=normalized_plugin_roots,
         include_project_memory=include_project_memory,
     )
-    # Item #2 (Brand Kit wiring): inject brand.yaml anchors into the
-    # system prompt so every turn sees the brand identity. This makes
-    # the agent brand-aware without needing to call brand_kit on every
-    # turn. The drift is generated lazily per-project, not here.
-    brand_section = _build_brand_anchor_section(cwd)
-    if brand_section:
-        system_prompt_text = f"{system_prompt_text}\n\n{brand_section}"
 
     restored_metadata = {
         "permission_mode": settings.permission.mode.value,
@@ -680,16 +656,6 @@ async def build_runtime(
     engine.tool_metadata["engine_ref"] = engine
     if autodream_context is not None:
         engine.tool_metadata["autodream_context"] = autodream_context
-    # Apply Kaggle-aware hardware defaults if running on Kaggle and the
-    # user hasn't explicitly overridden them. This auto-raises
-    # ``max_concurrent_agents`` and ``batch_size`` based on detected
-    # CPU + GPU counts so Kaggle users get full hardware utilization
-    # without manual config.
-    try:
-        from openharness.services.kaggle_env import apply_kaggle_defaults_to_settings
-        apply_kaggle_defaults_to_settings(settings)
-    except Exception:
-        pass  # Off-Kaggle or detection failed — use defaults
     # Apply optimization settings: #1 agent concurrency, #7 tool cache.
     try:
         from openharness.services.agent_concurrency import configure_agent_concurrency
@@ -699,6 +665,13 @@ async def build_runtime(
     try:
         from openharness.services.tool_cache import configure_tool_cache_from_settings
         configure_tool_cache_from_settings(settings)
+    except Exception:
+        pass
+    # Speed wave 2: async batch executor concurrency (fan-out LLM work:
+    # parallel_prompts tool, batch_scene retries).
+    try:
+        from openharness.services.batch_executor import configure_batch_executor_from_settings
+        configure_batch_executor_from_settings(settings)
     except Exception:
         pass
     # Restore messages from a saved session if provided

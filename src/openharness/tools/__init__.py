@@ -33,6 +33,8 @@ from openharness.tools.pipeline_tools import (
     CacheStatsTool,
     CheckpointTool,
     ControlTool,
+    CostReportTool,
+    ParallelPromptsTool,
     ProgressTool,
     QAReviewTool,
     RenderQueueStatusTool,
@@ -125,6 +127,9 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         AudioGenTool(),
         ServerConfigTool(),
         CacheStatsTool(),
+        # Speed wave 2: async batch executor + cost dashboard
+        ParallelPromptsTool(),
+        CostReportTool(),
     ):
         registry.register(tool)
     if mcp_manager is not None:

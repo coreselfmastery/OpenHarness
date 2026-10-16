@@ -8,6 +8,10 @@ do nothing, your existing config continues to work exactly as before.
 > added later — the inference / render / QA / control-plane pipelines.
 > It has its own section at the bottom:
 > [Waves 2-6: inference, render & control plane](#waves-2-6-inference-render--control-plane-items-1-50).
+>
+> **Speed wave 2 update:** the async batch executor + cost dashboard
+> (and the seven-bug fix wave that shipped with them) are documented in
+> [Speed wave 2: batch executor & cost dashboard](#speed-wave-2-batch-executor--cost-dashboard).
 
 ## Quick start
 
@@ -384,3 +388,56 @@ All off by default; `OPENHARNESS_CONTROL=1` enables the group.
   bus is absent (`None`) — verified by the 1423-test suite.
 - The SQLite store and audit/checkpoint/lock files are created lazily
   under `~/.openharness/` only when their feature is used.
+
+---
+
+# Speed wave 2: batch executor & cost dashboard
+
+Two new performance surfaces shipped after waves 2-6, plus a wave of
+bug fixes (the seven reported bugs and a deeper audit — see CHANGELOG
+for the full list). Everything here degrades to identity when unused.
+
+## Async batch executor (`services.batch_executor`)
+
+Bounded-concurrency fan-out for LLM work: up to
+`inference.batch_concurrency` (default 8, env
+`OPENHARNESS_BATCH_CONCURRENCY`) requests in flight at once behind a
+semaphore. Results are order-preserving; one failing item never cancels
+the others (its slot carries an `ItemFailure`); retry rounds re-run
+only the failures. It powers:
+
+- **`parallel_prompts` tool** — run N independent prompts concurrently
+  through a shared pooled HTTP client. Requires a configured endpoint
+  (scene_gen / QA / primary model settings); without one it refuses
+  honestly instead of inventing results.
+- **`batch_scene` concurrent retries** — scenes that fail their first
+  lint get their retry LLM calls fanned out concurrently (wall time ≈
+  the slowest retry, not the sum).
+
+## Cost dashboard (`services.cost_dashboard`)
+
+Every completed LLM response is priced and aggregated — always on, pure
+observability (in-memory counters, SQLite flushed every 25 records /
+30 s).
+
+| Aspect | Detail |
+|---|---|
+| Pricing | Longest-prefix per-model table (USD per 1M tokens, in/out), Anthropic cache multipliers (read 0.1x, write 1.25x input). |
+| Overrides | `OPENHARNESS_PRICING_JSON` — a JSON object mapping model prefix → `[input, output]`. |
+| Unknown models | Priced at $0 and counted as "unpriced" in reports — totals never silently lie. The session budget halt (`cost_budget_usd`) prices them conservatively ($3/$15 per 1M) so the safety control still trips. |
+| Persistence | Aggregates survive restarts in the shared SQLite store. |
+| Querying | `cost_report` tool: `summary` / `models` / `scenes` / `recent` / `clear`, plus projection when you pass `scenes_total` + `scenes_done`. |
+
+## Settings added
+
+| Field | Default | Env var |
+|---|---|---|
+| `inference.batch_concurrency` | 8 | `OPENHARNESS_BATCH_CONCURRENCY` |
+| `inference.key_pool_cooldown_seconds` | 60 | `OPENHARNESS_KEY_POOL_COOLDOWN_SECONDS` |
+
+Key-pool behavior note: a rate-limited key now enters a cooldown and is
+skipped until it expires; every key in the pool is tried before the
+error surfaces, and a short full-pool stall (≤5 s to earliest recovery)
+is waited out. Provider-routing fallbacks may declare their own `model`
+in the `provider_routing` config so a fallback endpoint is never asked
+for the primary's model name.

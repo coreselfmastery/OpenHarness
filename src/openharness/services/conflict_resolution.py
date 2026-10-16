@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -62,11 +63,35 @@ _REGISTRY = _PathLockRegistry()
 _DEFAULT_STALE_SECONDS = 600.0
 
 
+def _pid_from_label(label: str) -> int | None:
+    """Extract the trailing pid from a lock label like
+    ``openharness edit_file (pid 1234)``. Returns None when absent."""
+    match = re.search(r"pid\s+(\d+)", label)
+    return int(match.group(1)) if match else None
+
+
+def _process_alive(pid: int) -> bool:
+    """Best-effort liveness probe for a pid (False = not alive)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by someone else
+    except OSError:
+        return True
+    return True
+
+
 def _try_lockfile(lock_path: Path, label: str, *, stale_seconds: float) -> str:
     """Atomically create the cross-process lockfile. Returns "" on success.
 
     Returns the current holder's label when the lock is held by a live
-    process. Stale lockfiles (older than ``stale_seconds``) are stolen.
+    process. Stale locks are stolen when EITHER (a) the lockfile is older
+    than ``stale_seconds``, or (b) the holder pid recorded in the file is
+    no longer alive — the pid check recovers instantly from a killed or
+    crashed holder instead of blocking edits on that file for the whole
+    mtime window.
     """
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,9 +109,26 @@ def _try_lockfile(lock_path: Path, label: str, *, stale_seconds: float) -> str:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
         try:
-            return lock_path.read_text(encoding="utf-8").strip() or "another process"
+            current = lock_path.read_text(encoding="utf-8").strip()
         except OSError:
             return "another process"
+        if not current:
+            return "another process"
+        holder_pid = _pid_from_label(current)
+        if holder_pid is not None and holder_pid != os.getpid() and not _process_alive(holder_pid):
+            # Holder process is gone — steal its lock immediately.
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                return current
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(label)
+            return ""
+        return current or "another process"
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(label)
     return ""
@@ -115,7 +157,10 @@ async def acquire_path_lock(
     """
     resolved = str(Path(path).expanduser().resolve())
     lock_path = _lock_path_for(Path(resolved))
-    label = holder_label or f"agent pid {os.getpid()}"
+    # Always embed the pid so other processes can detect a dead holder
+    # and steal the lock instantly instead of waiting out the stale age.
+    label = holder_label or "agent"
+    label = f"{label} (pid {os.getpid()})"
     asyncio_lock = _REGISTRY.get(resolved)
 
     deadline = time.monotonic() + max(0.0, timeout_seconds)

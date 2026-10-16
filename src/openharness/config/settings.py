@@ -622,6 +622,14 @@ class InferenceSettings(BaseModel):
     # #6 — rotate a pool of API keys on rate limits (env:
     # OPENHARNESS_API_KEY_POOL, comma-separated; Groq: OPENHARNESS_GROQ_API_KEYS).
     api_key_pool: list[str] = Field(default_factory=list)
+    # Cooldown applied to a key after it hits a rate limit: the key is
+    # skipped until the cooldown expires, then it is eligible again
+    # (default 60s — matches typical provider RPM windows).
+    key_pool_cooldown_seconds: float = 60.0
+    # Bounded-concurrency fan-out for batch LLM work (the async batch
+    # executor): how many requests may be in flight at once. 8 balances
+    # throughput against typical provider concurrency limits.
+    batch_concurrency: int = 8
     # #1/#5 — speculative decoding / multi-token prediction are model
     # server features (Groq does speculation natively; vLLM needs server
     # flags — see the ``server_config`` tool). When True, the client
@@ -1369,6 +1377,8 @@ def _apply_env_overrides(settings: Settings) -> Settings:
             "OPENHARNESS_SEMANTIC_CACHE_THRESHOLD": ("semantic_cache_threshold", float),
             "OPENHARNESS_CROSS_PROVIDER_RACING": ("cross_provider_racing", bool),
             "OPENHARNESS_API_KEY_POOL": ("api_key_pool", _CsvList()),
+            "OPENHARNESS_KEY_POOL_COOLDOWN_SECONDS": ("key_pool_cooldown_seconds", float),
+            "OPENHARNESS_BATCH_CONCURRENCY": ("batch_concurrency", int),
         },
     )
     _nested(

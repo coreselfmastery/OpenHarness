@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, AsyncIterator
 
 from openharness.api.client import (
@@ -50,6 +50,12 @@ class ProviderRoute:
     # When this route's request fails, wait this long before trying the
     # next fallback. Default 0 means immediate fallback (no delay).
     delay_seconds: float = 0.0
+    # Model THIS route should serve. When set, requests sent through this
+    # route carry this model instead of the primary's — fallback routes
+    # point at different providers whose model names differ. Without it
+    # the fallback endpoint is asked for the primary's model name and
+    # usually 404s ("model not found").
+    model: str | None = None
 
 
 @dataclass
@@ -72,6 +78,20 @@ class RoutingStats:
             "last_route_used": self.last_route_used,
             "last_error": self.last_error,
         }
+
+
+def request_for_route(
+    request: ApiMessageRequest, route_model: str | None
+) -> ApiMessageRequest:
+    """Return a per-route copy of ``request`` carrying ``route_model``.
+
+    Model-specific knobs (``effort``, ``thinking_budget``) are cleared
+    when the model changes: they were chosen for the primary model and
+    mean something different (or nothing) on the fallback provider.
+    """
+    if not route_model or route_model == request.model:
+        return request
+    return replace(request, model=route_model, effort=None, thinking_budget=None)
 
 
 class RoutedStreamingClient(SupportsStreamingMessages):
@@ -141,7 +161,8 @@ class RoutedStreamingClient(SupportsStreamingMessages):
                 if route.delay_seconds > 0:
                     await asyncio.sleep(route.delay_seconds)
             try:
-                async for event in route.client.stream_message(request):
+                route_request = request_for_route(request, route.model)
+                async for event in route.client.stream_message(route_request):
                     yield event
                 if is_primary:
                     self._stats.primary_successes += 1
@@ -189,6 +210,7 @@ def build_fallback_route(name: str, cfg: dict[str, Any]) -> ProviderRoute | None
     api_format = (cfg.get("api_format") or "openai").strip().lower()
     api_key = cfg.get("api_key") or cfg.get("auth_token") or ""
     base_url = cfg.get("base_url")
+    route_model = (cfg.get("model") or "").strip() or None
     if not api_key:
         log.warning("route %s has no api_key; skipping", name)
         return None
@@ -200,4 +222,4 @@ def build_fallback_route(name: str, cfg: dict[str, Any]) -> ProviderRoute | None
     else:
         log.warning("route %s has unsupported api_format %r; skipping", name, api_format)
         return None
-    return ProviderRoute(name=name, client=client, delay_seconds=delay)
+    return ProviderRoute(name=name, client=client, delay_seconds=delay, model=route_model)

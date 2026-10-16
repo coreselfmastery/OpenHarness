@@ -63,6 +63,24 @@ def _reset_perf_caches():
         disable_tool_cache()
     except ImportError:
         pass
+    # Speed wave 2: hermetic cost dashboard + batch executor. The
+    # dashboard singleton would otherwise (a) persist aggregates across
+    # tests and (b) lazily open the REAL ~/.openharness SQLite store when
+    # a test wraps a client. Install a no-store dashboard per test;
+    # tests that want their own dashboard call set_cost_dashboard
+    # explicitly (overriding this one).
+    try:
+        from openharness.services.cost_dashboard import CostDashboard, set_cost_dashboard
+        set_cost_dashboard(CostDashboard(store=None))
+    except ImportError:
+        pass
+    # Batch executor: reset so a previous test's concurrency setting
+    # cannot leak into the next test's fan-out behavior.
+    try:
+        from openharness.services.batch_executor import set_batch_executor
+        set_batch_executor(None)
+    except ImportError:
+        pass
 
     yield
 
@@ -97,5 +115,17 @@ def _reset_perf_caches():
         from openharness.services.tool_cache import disable_tool_cache, reset_tool_cache
         reset_tool_cache()
         disable_tool_cache()
+    except ImportError:
+        pass
+    try:
+        # Drop the per-test dashboard (flushing anything it collected to
+        # nowhere — it has no store) and clear the executor singleton.
+        from openharness.services.cost_dashboard import set_cost_dashboard
+        set_cost_dashboard(None)
+    except ImportError:
+        pass
+    try:
+        from openharness.services.batch_executor import set_batch_executor
+        set_batch_executor(None)
     except ImportError:
         pass

@@ -544,6 +544,7 @@ class RenderPipeline:
             timeout_seconds=float(timeout_seconds or self.render_timeout_seconds),
         )
         self._jobs[job.job_id] = job
+        self._prune_jobs()
         self._queue.put_nowait(job)
         self._audit("render_enqueued", job)
         self._progress(job.scene.name, f"queued:{tier}")
@@ -586,16 +587,37 @@ class RenderPipeline:
         # Chain later waves onto the completion of earlier ones: each
         # next wave is submitted only when the previous one is finished.
         async def _chain() -> None:
-            while pending_waves:
-                previous = list(jobs_by_scene.values())
-                while any(j.status in {"pending", "running"} for j in previous):
-                    await asyncio.sleep(0.2)
-                wave = pending_waves.pop(0)
-                for name in wave:
-                    job = self.submit(
-                        graph.nodes[name].path, engine=engine, tier=tier, output_dir=output_dir
+            try:
+                while pending_waves:
+                    previous = list(jobs_by_scene.values())
+                    # Bounded wait: a dead worker (or a stuck "pending"
+                    # job after a shutdown) must not turn this task into
+                    # an infinite poller.
+                    stall_deadline = time.monotonic() + (
+                        max(
+                            (j.timeout_seconds or 1800.0 for j in previous),
+                            default=1800.0,
+                        )
+                        + 60.0
                     )
-                    jobs_by_scene[name] = job
+                    while any(j.status in {"pending", "running"} for j in previous):
+                        if time.monotonic() > stall_deadline:
+                            log.warning(
+                                "render wave chain: previous wave stalled; "
+                                "submitting next wave anyway"
+                            )
+                            break
+                        await asyncio.sleep(0.2)
+                    wave = pending_waves.pop(0)
+                    for name in wave:
+                        job = self.submit(
+                            graph.nodes[name].path, engine=engine, tier=tier, output_dir=output_dir
+                        )
+                        jobs_by_scene[name] = job
+            except Exception:
+                # The chain task is fire-and-forget; an unhandled error
+                # would silently strand every later wave.
+                log.exception("render dependency-wave chaining failed")
 
         if pending_waves:
             asyncio.create_task(_chain())
@@ -627,12 +649,34 @@ class RenderPipeline:
         """Render a cheap draft for QA review (#12/#16)."""
         return self.submit(scene, engine=engine, tier="draft", output_dir=output_dir)
 
+    def _jobs_for_scene(self, scene: Path, *, tier: str | None = None) -> list[RenderJob]:
+        """Find jobs for a scene, matching the resolved path first.
+
+        The basename fallback applies ONLY when the stored job path no
+        longer exists on disk (file moved/removed since the job ran) —
+        same-basename scenes in sibling directories must not collide.
+        """
+        try:
+            resolved = Path(scene).resolve()
+        except OSError:
+            resolved = Path(scene)
+        matches = []
+        for job in self._jobs.values():
+            if tier is not None and job.tier != tier:
+                continue
+            try:
+                if Path(job.scene).resolve() == resolved:
+                    matches.append(job)
+                    continue
+            except OSError:
+                pass
+            if not job.scene.exists() and job.scene.name == scene.name:
+                matches.append(job)
+        return matches
+
     def record_quality(self, scene: Path, score: float, *, tier: str = "draft") -> RenderJob | None:
         """Attach a QA score to the most recent job of this scene/tier."""
-        candidates = [
-            j for j in self._jobs.values()
-            if j.scene.name == scene.name and j.tier == tier
-        ]
+        candidates = self._jobs_for_scene(scene, tier=tier)
         if not candidates:
             return None
         job = max(candidates, key=lambda j: j.enqueued_at)
@@ -656,8 +700,7 @@ class RenderPipeline:
         - Otherwise: enqueue the full-resolution render (#12).
         """
         drafts = [
-            j for j in self._jobs.values()
-            if j.scene.name == scene.name and j.tier == "draft" and j.status == "done"
+            j for j in self._jobs_for_scene(scene, tier="draft") if j.status == "done"
         ]
         draft = max(drafts, key=lambda j: j.enqueued_at) if drafts else None
         if draft is not None and draft.quality_score is not None and draft.quality_score >= early_exit_threshold:
@@ -696,8 +739,20 @@ class RenderPipeline:
                 if self.completed_renders
                 else None
             ),
-            "codec": self.nvenc.codec_args(self.nvenc_enabled).split()[1],
+            "codec": self._active_codec_name(),
         }
+
+    def _active_codec_name(self) -> str:
+        """Codec short name for status displays (never raises)."""
+        parts = self.nvenc.codec_args(self.nvenc_enabled).split()
+        # Args look like "-c:v h264_nvenc -preset ..." — the codec name
+        # follows -c:v. A defensive scan survives template edits that
+        # change arg order; the previous ``.split()[1]`` raised IndexError
+        # for any single-token codec string.
+        for i, part in enumerate(parts):
+            if part in ("-c:v", "-c") and i + 1 < len(parts):
+                return parts[i + 1]
+        return parts[0] if parts else "unknown"
 
     def recent_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
         return [j.as_dict() for j in list(self._jobs.values())[-limit:]]
@@ -825,6 +880,24 @@ class RenderPipeline:
             self._progress(job.scene.name, f"render-failed:{job.tier}")
         self._finish(job)
 
+    def _prune_jobs(self, *, keep: int = 1000) -> None:
+        """Cap the job registry so long-running pipelines don't grow it
+        without bound. Terminal jobs beyond the newest ``keep`` are
+        dropped; pending/running jobs are always retained."""
+        if len(self._jobs) <= keep:
+            return
+        terminal = sorted(
+            (
+                (job.enqueued_at, job_id)
+                for job_id, job in self._jobs.items()
+                if job.status not in {"pending", "running"}
+            ),
+            key=lambda item: item[0],
+        )
+        excess = len(self._jobs) - keep
+        for _, job_id in terminal[:excess]:
+            self._jobs.pop(job_id, None)
+
     def _engine_args_for(self, job: RenderJob) -> list[str]:
         return self._templates.get(job.engine, [])[:2] + [job.tier]
 
@@ -850,17 +923,37 @@ class RenderPipeline:
                 pass
 
 
+def _visible_gpu_count() -> int:
+    """Cached count of usable GPUs (0 on CPU-only hosts)."""
+    global _GPU_COUNT_CACHE
+    if _GPU_COUNT_CACHE is None:
+        try:
+            from openharness.services.kaggle_env import detect_kaggle_resources
+
+            count = int(detect_kaggle_resources().get("gpu_count", 0) or 0)
+        except Exception:
+            count = 0
+        _GPU_COUNT_CACHE = max(0, count)
+    return _GPU_COUNT_CACHE
+
+
 def _worker_env(worker_id: int, worker_count: int) -> dict[str, str]:
     """Environment for a worker subprocess, pinning it to one GPU.
 
-    On multi-GPU hosts each worker gets its own GPU via
-    CUDA_VISIBLE_DEVICES, giving true per-GPU parallelism (#11).
+    On multi-GPU hosts each worker is pinned to one GPU via
+    CUDA_VISIBLE_DEVICES, cycling through the available GPUs when there
+    are more workers than GPUs (previously worker N was pinned to device
+    N — workers beyond the GPU count got non-existent device ids and
+    silently fell back to CPU rendering). On CPU-only hosts the variable
+    is not set at all, so CUDA auto-detection behaves normally.
     """
     import os
 
     env = dict(os.environ)
     if worker_count > 1:
-        env["CUDA_VISIBLE_DEVICES"] = str(worker_id)
+        gpu_count = _visible_gpu_count()
+        if gpu_count > 0:
+            env["CUDA_VISIBLE_DEVICES"] = str(worker_id % gpu_count)
     return env
 
 
@@ -869,6 +962,7 @@ def _worker_env(worker_id: int, worker_count: int) -> dict[str, str]:
 # ======================================================================
 
 _PIPELINE: RenderPipeline | None = None
+_GPU_COUNT_CACHE: int | None = None
 
 
 def recommended_worker_count(*, gpu_count: int | None = None) -> int:

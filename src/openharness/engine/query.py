@@ -26,6 +26,7 @@ from openharness.engine.messages import (
     ImageBlock,
     TextBlock,
     ToolResultBlock,
+    sanitize_conversation_messages,
 )
 from openharness.engine.stream_events import (
     AssistantTextDelta,
@@ -759,6 +760,17 @@ async def run_query(
         final_message: ConversationMessage | None = None
         usage = UsageSnapshot()
 
+        # Provider-safe history at request time: mid-turn rollbacks
+        # (checkpoint restore, #37) and interrupted flows can leave orphan
+        # tool_result blocks or a trailing unpaired tool_use; providers
+        # reject both with a 400. The engine sanitizes at submit/continue
+        # boundaries — this guards every outbound request as well.
+        sanitized_view = sanitize_conversation_messages(messages)
+        if len(sanitized_view) != len(messages) or any(
+            a is not b for a, b in zip(sanitized_view, messages)
+        ):
+            messages[:] = sanitized_view
+
         try:
             async for event in context.api_client.stream_message(
                 ApiMessageRequest(
@@ -1184,12 +1196,39 @@ async def _execute_tool_call(
             # for errors (it just doesn't cache them). Return it here so
             # the user sees the error from the first execution, not a
             # confusing re-run.
-            return ToolResultBlock(
+            tool_result = ToolResultBlock(
                 tool_use_id=tool_use_id,
                 content=cached_result.get("output", ""),
                 is_error=bool(cached_result.get("is_error", False)),
                 result_metadata=dict(cached_result.get("metadata") or {}),
             )
+            # Cache hits must not skip the post-execution bookkeeping:
+            # read_file_state carryover (task focus / edit-approval
+            # tracking) and PostToolUse hooks (audit, logging, security
+            # observers). Previously a cache hit returned early and hooks
+            # never saw the tool call at all.
+            _record_tool_carryover(
+                context,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_output=tool_result.content,
+                tool_result_metadata=tool_result.result_metadata,
+                is_error=tool_result.is_error,
+                resolved_file_path=_file_path,
+            )
+            if context.hook_executor is not None:
+                await context.hook_executor.execute(
+                    HookEvent.POST_TOOL_USE,
+                    {
+                        "tool_name": tool_name,
+                        "tool_input": tool_input,
+                        "tool_output": tool_result.content,
+                        "tool_is_error": tool_result.is_error,
+                        "from_cache": True,
+                        "event": HookEvent.POST_TOOL_USE.value,
+                    },
+                )
+            return tool_result
         # cached_result is None → executor returned None (shouldn't happen
         # for normal tools) or raised. Fall through to the non-cached path.
 

@@ -318,7 +318,12 @@ class ControlBus:
         return self._shutdown_phase
 
     async def begin_shutdown(self, *, reason: str = "graceful shutdown") -> None:
-        """Drain in-flight work, run shutdown hooks, close the bus (#32)."""
+        """Drain in-flight work, run shutdown hooks, close the bus (#32).
+
+        Also stops the watchdog / deadlock monitor tasks — previously they
+        kept looping forever after the bus was closed, leaking two tasks
+        per session in long-lived processes and test suites.
+        """
         if self._shutdown_phase != "running":
             return
         self._shutdown_phase = "draining"
@@ -332,8 +337,17 @@ class ControlBus:
                 log.warning("shutdown hook failed: %s", exc)
         self._shutdown_phase = "closed"
         self.state.shutdown_phase = "closed"
+        self._stop_monitor_tasks()
         get_audit_log().record_control("shutdown.complete", {})
         log.info("graceful shutdown complete")
+
+    def _stop_monitor_tasks(self) -> None:
+        """Cancel watchdog/deadlock monitor tasks (idempotent)."""
+        for task in (self._watchdog_task, self._deadlock_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._watchdog_task = None
+        self._deadlock_task = None
 
     def status(self) -> dict[str, Any]:
         state = self.state.as_dict()
@@ -357,8 +371,15 @@ def get_control_bus() -> ControlBus:
 
 
 def set_control_bus(bus: ControlBus | None) -> None:
-    """Test helper: install or reset the singleton."""
+    """Install or reset the singleton.
+
+    When replacing a live bus, its monitor tasks are stopped first —
+    otherwise every session rebuild leaked a watchdog and a deadlock
+    monitor task that kept referencing the orphaned bus forever.
+    """
     global _BUS
+    if _BUS is not None and _BUS is not bus:
+        _BUS._stop_monitor_tasks()
     _BUS = bus
 
 

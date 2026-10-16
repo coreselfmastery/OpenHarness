@@ -37,13 +37,18 @@ def _unwrap_pipeline(client):
 
     Since the waves 2-6 wiring, ``_resolve_api_client_from_settings``
     wraps every client with ``InferencePipelineClient`` (prefix caching
-    is on by default). The routing/plain-client assertions below must
-    therefore look at the unwrapped transport.
+    is on by default). The speed-wave-2 cost dashboard added a second
+    always-on transparent layer, ``UsageTrackingClient`` (pure
+    observability). The routing/plain-client assertions below must
+    therefore look through BOTH wrappers to the transport.
     """
-    from openharness.services.llm_pipeline import InferencePipelineClient
+    from openharness.services.llm_pipeline import (
+        InferencePipelineClient,
+        UsageTrackingClient,
+    )
 
-    for _ in range(5):  # bounded unwrap, wrappers are at most 3 deep
-        if isinstance(client, InferencePipelineClient):
+    for _ in range(6):  # bounded unwrap, wrappers are at most 4 deep
+        if isinstance(client, (InferencePipelineClient, UsageTrackingClient)):
             client = client._inner
         else:
             break

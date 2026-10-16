@@ -1032,13 +1032,32 @@ async def test_external_lockfile_conflict_names_the_holder(tmp_path: Path):
     target.write_text("x = 1")
     lock = _lock_path_for(target)
     lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("agent pid 99999", encoding="utf-8")
+    # A lock held by a LIVE process (our own pid) must be respected,
+    # never stolen — the holder name is surfaced in the error.
+    lock.write_text(f"agent (pid {os.getpid()})", encoding="utf-8")
     with pytest.raises(FileConflictError) as excinfo:
         async with acquire_path_lock(target, timeout_seconds=0.2, holder_label="me"):
             pass
-    assert "agent pid 99999" in str(excinfo.value)
-    # The foreign lock is respected, not stolen (fresh mtime).
+    assert f"pid {os.getpid()}" in str(excinfo.value)
+    # The foreign lock is respected, not stolen (live holder, fresh mtime).
     assert lock.exists()
+
+
+@pytest.mark.asyncio
+async def test_dead_holder_lockfile_is_stolen_instantly(tmp_path: Path):
+    """A lockfile left by a crashed process is stolen without waiting out
+    the stale-age window (pid liveness check)."""
+    from openharness.services.conflict_resolution import _lock_path_for, acquire_path_lock
+
+    target = tmp_path / "crashed.py"
+    target.write_text("x = 1")
+    lock = _lock_path_for(target)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    # Fresh mtime (age 0) but the holder pid is gone.
+    lock.write_text("agent (pid 999999998)", encoding="utf-8")
+    async with acquire_path_lock(target, timeout_seconds=1.0, stale_seconds=600.0):
+        assert lock.exists()
+        assert str(os.getpid()) in lock.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -1049,13 +1068,14 @@ async def test_stale_lockfile_is_stolen(tmp_path: Path):
     target.write_text("x = 1")
     lock = _lock_path_for(target)
     lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("agent pid 1", encoding="utf-8")
+    # No pid in the label (legacy format) — the mtime path must still steal.
+    lock.write_text("legacy holder", encoding="utf-8")
     old = time.time() - 10_000
     os.utime(lock, (old, old))
     async with acquire_path_lock(target, timeout_seconds=1, stale_seconds=600, holder_label="stealer"):
-        # The stale lock was replaced by OUR lockfile (fresh label).
+        # The stale lock was replaced by OUR lockfile (fresh label + pid).
         assert lock.exists()
-        assert lock.read_text(encoding="utf-8").strip() == "stealer"
+        assert lock.read_text(encoding="utf-8").strip().startswith("stealer")
 
 
 def test_configure_file_locking_from_settings():

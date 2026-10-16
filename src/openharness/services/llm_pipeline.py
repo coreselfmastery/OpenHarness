@@ -132,13 +132,49 @@ class PromptCompressor:
                 else:
                     new_blocks.append(block)
             if changed:
-                out.append(ConversationMessage(role=message.role, content=new_blocks))
+                new_message = ConversationMessage(role=message.role, content=new_blocks)
+                out.append(new_message)
+                self._propagate_compressed_estimate(message, new_message)
             else:
                 out.append(message)
         if saved > 0:
             self.requests_compressed += 1
             self.chars_saved += saved
         return out
+
+    @staticmethod
+    def _propagate_compressed_estimate(
+        original: ConversationMessage, compressed: ConversationMessage
+    ) -> None:
+        """Publish the compressed token count onto the ORIGINAL message.
+
+        The engine's auto-compact decision walks the original message
+        list with ``compact.estimate_message_tokens``, whose per-message
+        cache (``_oh_token_cache``) previously still held the
+        UNCOMPRESSED count after the compressor shrank the outbound copy.
+        The engine therefore believed the conversation was larger than
+        the request it actually sends and compacted earlier than
+        necessary. Stashing the compressed count — validated against the
+        original block identity, exactly like the normal cache path —
+        keeps the estimate in sync with what goes on the wire. An
+        in-place mutation of the original blocks invalidates it and the
+        next estimate recomputes from scratch (safe degradation).
+        """
+        try:
+            from openharness.services.compact import (
+                _estimate_single_message_tokens,
+                _vision_token_budget_per_image,
+            )
+
+            budget = _vision_token_budget_per_image()
+            new_tokens = _estimate_single_message_tokens(compressed, budget)
+            object.__setattr__(
+                original,
+                "_oh_token_cache",
+                (budget, new_tokens, tuple(original.content)),
+            )
+        except Exception:
+            pass  # cache maintenance must never break compression
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -152,6 +188,29 @@ class PromptCompressor:
 # ======================================================================
 
 _MERSENNE = (1 << 61) - 1
+
+
+def _stable_shingle_hash(shingle: str, memo: dict[str, int]) -> int:
+    """Stable (cross-process) 64-bit hash of one shingle.
+
+    Python's builtin ``hash()`` is salted per process (PYTHONHASHSEED),
+    so signatures built with it cannot be compared across sessions —
+    exactly what the SQLite-persisted semantic cache needs to do.
+    blake2b is stable and fast; results are memoized per call because
+    the same shingles recur within one prompt.
+    """
+    cached = memo.get(shingle)
+    if cached is not None:
+        return cached
+    import hashlib
+
+    value = int.from_bytes(
+        hashlib.blake2b(shingle.encode("utf-8"), digest_size=8).digest(),
+        "big",
+        signed=False,
+    )
+    memo[shingle] = value
+    return value
 
 
 def _minhash_signature(text: str, *, hash_count: int = 64, seed: int = 0x9E3779B9) -> list[int]:
@@ -171,12 +230,13 @@ def _minhash_signature(text: str, *, hash_count: int = 64, seed: int = 0x9E3779B
         shingles = [" ".join(words[i : i + 3]) for i in range(len(words) - 2)]
 
     signature: list[int] = []
+    memo: dict[str, int] = {}
     for func_index in range(hash_count):
         a = (seed * (func_index + 1) * 2 + 1) % _MERSENNE
         b = (seed + func_index * 1_114_111 + 7) % _MERSENNE
         minimum = _MERSENNE
         for shingle in shingles:
-            h = (a * hash(shingle) + b) % _MERSENNE
+            h = (a * _stable_shingle_hash(shingle, memo) + b) % _MERSENNE
             if h < minimum:
                 minimum = h
         signature.append(minimum)
@@ -219,13 +279,28 @@ class SemanticCache:
 
     @staticmethod
     def _request_text(request: ApiMessageRequest) -> str:
+        """Similarity text = the USER messages only.
+
+        The system prompt is deliberately excluded: it is long, largely
+        stable across a session (environment, skills, brand anchors,
+        memory sections), and would dominate the shingle set. Two
+        different short questions sharing one long system prompt scored
+        > 0.88 similarity and replayed the WRONG cached response. The
+        user turns are what actually distinguishes one request from
+        another.
+        """
         parts: list[str] = []
-        if request.system_prompt:
-            parts.append(request.system_prompt)
         for message in request.messages:
             if message.role == "user":
                 parts.append(message.text)
         return "\n".join(parts)
+
+    @staticmethod
+    def _stable_key(text: str) -> str:
+        """Stable cache key (sha256 prefix) — survives process restarts."""
+        import hashlib
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
     def lookup(self, request: ApiMessageRequest) -> ApiMessageCompleteEvent | None:
         if self._store is None:
@@ -233,6 +308,13 @@ class SemanticCache:
         text = self._request_text(request)
         if not text.strip():
             return None
+        # Short prompts ("ok", "continue", one-line scene requests) only
+        # match when token-identical (similarity exactly 1.0 — punctuation
+        # and whitespace differences still hit, but any wording change
+        # misses). Longer prompts use the configured approximate
+        # threshold.
+        word_count = len(text.split())
+        effective_threshold = 1.0 if word_count < 12 else self.threshold
         signature = _minhash_signature(text)
         best_key: str | None = None
         best_score = 0.0
@@ -241,7 +323,7 @@ class SemanticCache:
             if score > best_score:
                 best_score = score
                 best_key = key
-        if best_key is not None and best_score >= self.threshold:
+        if best_key is not None and best_score >= effective_threshold:
             entry = self._store.get(self.NAMESPACE, best_key) or {}
             payload = entry.get("response") or {}
             message_data = payload.get("message")
@@ -271,7 +353,7 @@ class SemanticCache:
         text = self._request_text(request)
         if not text.strip():
             return
-        key = f"{hash(text) & 0xFFFFFFFF:08x}"
+        key = self._stable_key(text)
         payload = {
             "signature": _minhash_signature(text),
             "created_at": time.time(),
@@ -298,29 +380,62 @@ class SemanticCache:
 # #6 — API key rotation pool
 # ======================================================================
 
+DEFAULT_KEY_COOLDOWN_SECONDS = 60.0
+# When EVERY key in the pool is cooling down mid-request, wait ONLY for
+# short recoveries (a burst of 429s where a key frees up in seconds).
+# Longer waits are the engine retry layer's job — surfacing the
+# rate-limit error immediately is better than parking a request inside
+# the client for a full cooldown window.
+_MAX_POOL_WAIT_SECONDS = 5.0
+
+
 class KeyRotatingClient(SupportsStreamingMessages):
     """Rotate across N API keys to multiply provider rate limits.
 
-    Round-robins a key per request (spreading quota across accounts) and,
-    when the active key gets rate-limited (``RateLimitFailure``),
-    immediately rotates to the next key and replays the request — once
-    per key before giving up. Rotation counters are exposed via
-    ``stats`` for observability.
+    Design (10x-throughput key pool):
 
-    ``client_factory(key)`` builds a fresh client per key; the factory
-    is the runtime's own client builder, so every pool client has the
+    - Round-robins a key per request, spreading quota across accounts:
+      request 1 -> key A, request 2 -> key B, ...
+    - When the active key is rate-limited (``RateLimitFailure``), it
+      enters a cooldown (default 60s) keyed by a monotonic timestamp and
+      the request is instantly replayed on the next HEALTHY key — every
+      key in the pool is tried, not just a fixed 3.
+    - ``_next_available_key`` always returns the next key whose cooldown
+      has expired, skipping cooling keys proactively (they fail fast
+      with 429s otherwise and just burn latency).
+    - A key that succeeds is immediately healthy again (cooldown
+      cleared); when ALL keys are cooling, the request waits for the
+      earliest expiry (bounded by ``_MAX_POOL_WAIT_SECONDS``) and then
+      retries rather than failing outright.
+    - Cooldown duration is configurable (``key_pool_cooldown_seconds``,
+      env ``OPENHARNESS_KEY_POOL_COOLDOWN_SECONDS``).
+
+    Rotation/cooldown counters are exposed via ``stats`` for
+    observability. ``client_factory(key)`` builds a fresh client per key
+    (the runtime's own client builder), so every pool client has the
     exact same configuration apart from the credential.
     """
 
-    def __init__(self, keys: list[str], client_factory: Callable[[str], SupportsStreamingMessages]) -> None:
+    def __init__(
+        self,
+        keys: list[str],
+        client_factory: Callable[[str], SupportsStreamingMessages],
+        *,
+        cooldown_seconds: float = DEFAULT_KEY_COOLDOWN_SECONDS,
+    ) -> None:
         if not keys:
             raise ValueError("key pool must not be empty")
         self._keys = list(keys)
         self._factory = client_factory
         self._clients: dict[int, SupportsStreamingMessages] = {}
         self._index = 0
+        # key index -> monotonic time when its cooldown expires.
+        self._cooldown_until: dict[int, float] = {}
+        self._cooldown_seconds = max(0.0, float(cooldown_seconds))
         self.rotations_on_rate_limit = 0
+        self.cooldowns_taken = 0
         self.requests_served = 0
+        self.pool_waits = 0
 
     def _client_for(self, index: int) -> SupportsStreamingMessages:
         client = self._clients.get(index)
@@ -329,35 +444,95 @@ class KeyRotatingClient(SupportsStreamingMessages):
             self._clients[index] = client
         return client
 
+    def _next_available_key(self, exclude: set[int]) -> tuple[int | None, float]:
+        """Pick the next healthy key.
+
+        Scans the pool round-robin from ``self._index`` and returns the
+        first key that (a) was not already tried for this request and
+        (b) has no active cooldown. When no such key exists, returns
+        ``(None, seconds_until_earliest_cooldown_expiry)`` so the caller
+        can decide to wait.
+        """
+        n = len(self._keys)
+        now = time.monotonic()
+        for offset in range(n):
+            index = (self._index + offset) % n
+            if index in exclude:
+                continue
+            if now >= self._cooldown_until.get(index, 0.0):
+                return index, 0.0
+        # No untried healthy key. Earliest cooldown expiry across ALL
+        # keys (tried or not — an untried cooling key may expire first).
+        soonest = min(range(n), key=lambda i: self._cooldown_until.get(i, float("inf")))
+        wait = max(0.0, self._cooldown_until.get(soonest, 0.0) - now)
+        return None, wait
+
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
-        attempts = min(len(self._keys), 3)
+        total_keys = len(self._keys)
         last_error: Exception | None = None
-        for attempt in range(attempts):
-            index = (self._index + attempt) % len(self._keys)
+        tried: set[int] = set()
+        # Bound the loop: one attempt per key, plus at most one wait
+        # round when the whole pool was cooling — a permanently
+        # throttled provider must surface its rate-limit error, not
+        # spin here forever.
+        attempts_left = 2 * total_keys
+        while attempts_left > 0:
+            attempts_left -= 1
+            index, wait = self._next_available_key(tried)
+            if index is None:
+                if wait <= 0 or wait > _MAX_POOL_WAIT_SECONDS:
+                    # Nothing recoverable within the wait budget. NEVER
+                    # end the stream silently — an empty response would
+                    # look like a successful blank completion to the
+                    # engine. Surface the provider error, or a pool-
+                    # cooldown error when no key was even attempted.
+                    if last_error is not None:
+                        raise last_error
+                    raise RateLimitFailure(
+                        f"key pool: all {total_keys} keys are in cooldown "
+                        f"(earliest recovery in {max(0.0, wait):.0f}s)"
+                    )
+                self.pool_waits += 1
+                yield ApiRetryEvent(
+                    message=(
+                        f"key pool: all {total_keys} keys rate-limited; "
+                        f"waiting {wait:.0f}s for the earliest cooldown"
+                    ),
+                    attempt=total_keys - len([i for i in tried if i is not None]),
+                    max_attempts=total_keys,
+                    delay_seconds=wait,
+                )
+                await asyncio.sleep(wait + 0.05)
+                tried.clear()  # every key is eligible again after the wait
+                continue
             client = self._client_for(index)
             try:
                 async for event in client.stream_message(request):
                     yield event
-                # Success: advance the round-robin past the used key.
-                self._index = (index + 1) % len(self._keys)
+                # Success: this key is healthy again, and the
+                # round-robin resumes on the NEXT key.
+                self._cooldown_until.pop(index, None)
+                self._index = (index + 1) % total_keys
                 self.requests_served += 1
                 return
             except RateLimitFailure as exc:
                 last_error = exc
+                tried.add(index)
+                if self._cooldown_seconds > 0:
+                    self._cooldown_until[index] = time.monotonic() + self._cooldown_seconds
+                    self.cooldowns_taken += 1
                 self.rotations_on_rate_limit += 1
                 log.warning(
-                    "key pool: key #%d rate-limited; rotating (attempt %d/%d)",
+                    "key pool: key #%d rate-limited; cooling down %.0fs and rotating to next healthy key",
                     index,
-                    attempt + 1,
-                    attempts,
+                    self._cooldown_seconds,
                 )
                 yield ApiRetryEvent(
                     message=f"API key #{index + 1} rate-limited; rotating to next key",
-                    attempt=attempt,
-                    max_attempts=attempts,
+                    attempt=len(tried),
+                    max_attempts=total_keys,
                     delay_seconds=0.0,
                 )
-                continue
         if last_error is not None:
             raise last_error
 
@@ -371,11 +546,85 @@ class KeyRotatingClient(SupportsStreamingMessages):
                     pass
 
     def stats(self) -> dict[str, Any]:
+        now = time.monotonic()
+        cooling = [
+            index
+            for index, deadline in self._cooldown_until.items()
+            if deadline > now
+        ]
         return {
             "pool_size": len(self._keys),
             "requests_served": self.requests_served,
             "rotations_on_rate_limit": self.rotations_on_rate_limit,
+            "cooldowns_taken": self.cooldowns_taken,
+            "keys_in_cooldown": len(cooling),
+            "pool_waits": self.pool_waits,
+            "cooldown_seconds": self._cooldown_seconds,
         }
+
+
+# ======================================================================
+# #6b — Cost dashboard usage tracking
+# ======================================================================
+
+class UsageTrackingClient(SupportsStreamingMessages):
+    """Record every completed LLM response into the cost dashboard.
+
+    Sits directly around the provider client stack, so it sees exactly
+    what actually went on the wire — requests that reached a provider
+    and completed. Free replays (semantic-cache hits) never reach this
+    layer and are correctly NOT billed; rate-limited key-pool attempts
+    produce no complete event and cost nothing. Cross-provider racing
+    bills the losing routes at their own providers — those tokens are
+    invisible here (the winner's stream is the only one surfaced), which
+    the racing feature's own stats call out honestly.
+
+    Recording is synchronous in-memory aggregation + occasional SQLite
+    flush (see :mod:`openharness.services.cost_dashboard`); it never
+    blocks the stream and never raises into it.
+    """
+
+    def __init__(self, inner: SupportsStreamingMessages, dashboard: Any | None = None) -> None:
+        self._inner = inner
+        self._dashboard = dashboard
+
+    async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
+        dashboard = self._dashboard
+        async for event in self._inner.stream_message(request):
+            if (
+                dashboard is not None
+                and type(event) is ApiMessageCompleteEvent
+                and (event.usage.input_tokens or event.usage.output_tokens)
+            ):
+                try:
+                    dashboard.record(
+                        model=request.model,
+                        input_tokens=event.usage.input_tokens,
+                        output_tokens=event.usage.output_tokens,
+                        cache_write_tokens=event.usage.cache_write_tokens,
+                        cache_read_tokens=event.usage.cache_read_tokens,
+                        source="pipeline",
+                    )
+                except Exception:  # noqa: BLE001 - tracking must never break a stream
+                    log.exception("cost dashboard recording failed")
+            yield event
+
+    async def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                pass
+
+    def __getattr__(self, name: str) -> Any:
+        # Transparent passthrough (e.g. stats() on RacingClient /
+        # KeyRotatingClient for the cache_stats tool) so wrapping never
+        # hides observability surface. The _inner guard prevents infinite
+        # recursion when the attribute is accessed before __init__ ran.
+        if name == "_inner":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
 
 
 # ======================================================================
@@ -399,11 +648,17 @@ class RacingClient(SupportsStreamingMessages):
     that reason.
     """
 
-    def __init__(self, routes: list[tuple[str, SupportsStreamingMessages]]) -> None:
+    def __init__(self, routes: list[tuple]) -> None:
         if len(routes) < 2:
             raise ValueError("racing needs at least two routes")
-        self._routes = list(routes)
-        self.races_won: dict[str, int] = {name: 0 for name, _ in routes}
+        # Routes are (name, client) or (name, client, model) tuples — the
+        # third element is the route's own model. When set, each request
+        # is rewritten per route so a fallback endpoint is never asked
+        # for the primary's model name (it would 404).
+        self._routes: list[tuple[str, SupportsStreamingMessages, str | None]] = [
+            (r[0], r[1], (r[2] if len(r) > 2 else None)) for r in routes
+        ]
+        self.races_won: dict[str, int] = {name: 0 for name, _, _ in self._routes}
         self.races_run = 0
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
@@ -446,18 +701,21 @@ class RacingClient(SupportsStreamingMessages):
         pending: set[int] = set()
         tasks: list[asyncio.Task[None]] = []
 
-        async def _pump(index: int, client: SupportsStreamingMessages) -> None:
+        async def _pump(index: int, client: SupportsStreamingMessages, route_model: str | None) -> None:
             try:
-                async for event in client.stream_message(request):
+                from openharness.services.provider_routing import request_for_route
+
+                route_request = request_for_route(request, route_model)
+                async for event in client.stream_message(route_request):
                     await queue.put((index, event))
                 await queue.put((index, _RaceDone()))
             except Exception as exc:  # noqa: BLE001 - forwarded to the race loop
                 setattr(exc, "_failed_route_index", index)
                 await queue.put((index, exc))
 
-        for index, (_name, client) in enumerate(routes):
+        for index, (_name, client, route_model) in enumerate(routes):
             pending.add(index)
-            tasks.append(asyncio.create_task(_pump(index, client)))
+            tasks.append(asyncio.create_task(_pump(index, client, route_model)))
 
         streams: dict[int, AsyncIterator[ApiStreamEvent]] = {}
         error: Exception | None = None
@@ -501,7 +759,7 @@ class RacingClient(SupportsStreamingMessages):
                         task.cancel()
 
     async def close(self) -> None:
-        for _name, client in self._routes:
+        for _name, client, _model in self._routes:
             close = getattr(client, "close", None)
             if close is not None:
                 try:
@@ -616,20 +874,9 @@ def speculative_capability_report(
 
 # Rough USD per 1M tokens (in, out). Editable, best-effort — used for
 # ALERTING, not billing. Unknown models fall back to mid-tier pricing.
-DEFAULT_PRICE_TABLE: dict[str, tuple[float, float]] = {
-    "claude-sonnet": (3.0, 15.0),
-    "claude-opus": (15.0, 75.0),
-    "claude-haiku": (0.8, 4.0),
-    "gpt-4o": (2.5, 10.0),
-    "gpt-4o-mini": (0.15, 0.6),
-    "gpt-4.1": (2.0, 8.0),
-    "gpt-5": (3.0, 15.0),
-    "llama": (0.05, 0.08),
-    "qwen": (0.4, 1.2),
-    "deepseek": (0.3, 1.1),
-    "kimi": (0.6, 2.5),
-    "gemini-flash": (0.1, 0.4),
-}
+# NOTE: pricing lives in one place — openharness.services.cost_dashboard
+# (longest-prefix table, OPENHARNESS_PRICING_JSON overrides). The session
+# cost tracker delegates to it so the two can never disagree.
 
 
 @dataclass
@@ -645,10 +892,22 @@ class CostAlert:
 class SessionCostTracker:
     """Estimates session cost from usage snapshots and raises threshold alerts.
 
-    Cache-read tokens are priced at 10% of full input price (Anthropic's
-    prompt-cache discount) so enabling prefix caching shows up as a real
-    saving. Alerts fire once per threshold crossing, never repeatedly.
+    Pricing is delegated to the cost dashboard's table (longest-prefix
+    match, env-overridable) so the session tracker and the persistent
+    dashboard can never disagree. Models missing from the table are
+    priced with a conservative mid-tier fallback ($3/$15 per 1M) — this
+    is a SAFETY control, and an unknown model name must never silently
+    disable the budget halt (the dashboard still reports such models
+    honestly as $0/unpriced). Cache-read tokens are priced at 10% of
+    full input price (Anthropic's prompt-cache discount) so enabling
+    prefix caching shows up as a real saving. Alerts fire once per
+    threshold crossing, never repeatedly.
     """
+
+    # Conservative pricing for models with no table entry. Historically
+    # the tracker priced EVERYTHING at (3.0, 15.0) when unknown; keeping
+    # that as the explicit fallback preserves the halt's guarantee.
+    UNPRICED_FALLBACK = (3.0, 15.0)
 
     def __init__(self, *, budget_usd: float | None, warn_ratio: float = 0.8) -> None:
         self.budget_usd = budget_usd
@@ -662,21 +921,20 @@ class SessionCostTracker:
         self.on_alert: Callable[[CostAlert], None] | None = None
 
     def estimate_cost_usd(self, model: str, usage: Any) -> float:
-        model_l = (model or "").lower()
-        price_in, price_out = 3.0, 15.0
-        for prefix, prices in DEFAULT_PRICE_TABLE.items():
-            if prefix in model_l:
-                price_in, price_out = prices
-                break
+        # Single source of truth: the cost dashboard's pricing table.
+        from openharness.services.cost_dashboard import estimate_cost
+
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
         cache_read = int(getattr(usage, "cache_read_tokens", 0) or 0)
         cache_write = int(getattr(usage, "cache_write_tokens", 0) or 0)
-        cost = (
-            input_tokens * price_in / 1_000_000
-            + cache_read * price_in * 0.1 / 1_000_000
-            + cache_write * price_in * 1.25 / 1_000_000
-            + output_tokens * price_out / 1_000_000
+        cost, _priced = estimate_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_write_tokens=cache_write,
+            cache_read_tokens=cache_read,
+            unpriced_fallback=self.UNPRICED_FALLBACK,
         )
         return cost
 
@@ -866,11 +1124,25 @@ class ClientFactoryProtocol(Protocol):
     def __call__(self, api_key: str) -> SupportsStreamingMessages: ...
 
 
+def _dashboard_if_available() -> Any | None:
+    """Return the process-wide cost dashboard, or None (never raises).
+
+    Lazy import: cost_dashboard pulls in the persistent store; keeping it
+    out of module import time avoids any import-cycle / startup cost.
+    """
+    try:
+        from openharness.services.cost_dashboard import get_cost_dashboard
+
+        return get_cost_dashboard()
+    except Exception:  # noqa: BLE001 - observability must never break setup
+        return None
+
+
 def wrap_client_with_inference_pipeline(
     settings: Any,
     primary: SupportsStreamingMessages,
     *,
-    fallback_routes: list[tuple[str, SupportsStreamingMessages]] | None = None,
+    fallback_routes: list[tuple] | None = None,
     client_factory: ClientFactoryProtocol | None = None,
 ) -> SupportsStreamingMessages:
     """Wrap ``primary`` with every enabled inference feature.
@@ -878,10 +1150,18 @@ def wrap_client_with_inference_pipeline(
     Called by the runtime right after the primary client is built. All
     wrappers degrade to identity: when no feature is enabled the
     original client is returned untouched.
+
+    ``fallback_routes`` entries are ``(name, client)`` or
+    ``(name, client, model)`` tuples — the optional third element is the
+    route's own model name, used to rewrite raced requests per route.
     """
     inference = getattr(settings, "inference", None)
     if inference is None:
-        return primary
+        # No inference settings at all (bare/test setups): still track
+        # usage when a dashboard is available — cost visibility is not
+        # an opt-in performance feature.
+        dashboard = _dashboard_if_available()
+        return UsageTrackingClient(primary, dashboard) if dashboard is not None else primary
 
     inner = primary
 
@@ -889,8 +1169,12 @@ def wrap_client_with_inference_pipeline(
     key_pool = [k for k in (getattr(inference, "api_key_pool", None) or []) if k.strip()]
     if len(key_pool) >= 1 and client_factory is not None:
         try:
-            inner = KeyRotatingClient(key_pool, client_factory)
-            log.info("key rotation enabled with %d keys", len(key_pool))
+            cooldown = float(
+                getattr(inference, "key_pool_cooldown_seconds", DEFAULT_KEY_COOLDOWN_SECONDS)
+                or DEFAULT_KEY_COOLDOWN_SECONDS
+            )
+            inner = KeyRotatingClient(key_pool, client_factory, cooldown_seconds=cooldown)
+            log.info("key rotation enabled with %d keys (cooldown %.0fs)", len(key_pool), cooldown)
         except Exception as exc:
             log.warning("key rotation setup failed: %s", exc)
 
@@ -901,11 +1185,21 @@ def wrap_client_with_inference_pipeline(
         and len(fallback_routes) >= 1
     ):
         try:
-            routes = [("primary", inner)] + list(fallback_routes)
+            routes = [("primary", inner, None)] + [tuple(r) for r in fallback_routes]
             inner = RacingClient(routes[:3])
             log.info("cross-provider racing enabled across %d routes", len(routes[:3]))
         except Exception as exc:
             log.warning("racing setup failed: %s", exc)
+
+    # Cost dashboard (#28/#6-speed): record every completed response.
+    # Always on — pure observability, no request-path cost beyond an
+    # in-memory counter update. Sits ABOVE the transport layers (key
+    # pool, racing, routing) so whichever key/route served the request
+    # is recorded once, and BELOW the semantic cache so free cache
+    # replays are not billed.
+    dashboard = _dashboard_if_available()
+    if dashboard is not None:
+        inner = UsageTrackingClient(inner, dashboard)
 
     # #18/#3/#2 — pipeline wrapper (only when at least one is on).
     semantic_cache = None

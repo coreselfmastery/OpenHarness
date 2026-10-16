@@ -99,6 +99,88 @@ def _build_permission_mode_section(settings: Settings) -> str:
     return f"# Current Permission Mode\n{guidance}"
 
 
+# brand.yaml is re-read on EVERY system-prompt rebuild (once per user
+# line). Cache the built section keyed by (mtime_ns, size) so unchanged
+# files skip the YAML parse; any write invalidates immediately.
+_BRAND_CACHE: dict[str, tuple[tuple[int, int], str | None]] = {}
+
+
+def _build_brand_anchor_section(cwd: str | Path) -> str | None:
+    """Load brand.yaml from the project root and build a system-prompt section.
+
+    Returns None when brand.yaml is missing (no overhead). When present,
+    returns a formatted section that lists the brand anchors (name,
+    colors, fonts, voice, music style, min type size, safe area, easing)
+    so the agent is brand-aware on every turn without needing to call
+    the brand_kit tool explicitly.
+
+    Defined here (not in ui/runtime.py) so that EVERY caller of
+    :func:`build_runtime_system_prompt` — session build, per-line prompt
+    refresh, command submit_prompt/continue_pending paths — includes the
+    brand anchors. Previously only session build injected them, so the
+    first per-line prompt rebuild silently wiped them.
+    """
+    brand_path = Path(cwd) / "brand.yaml"
+    cache_key = str(brand_path)
+    try:
+        stat = brand_path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        _BRAND_CACHE.pop(cache_key, None)
+        return None
+    cached = _BRAND_CACHE.get(cache_key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        # Lazy import: tools.brand_kit_tool must not be imported at module
+        # load time (heavy deps; also avoids any import cycle risk).
+        from openharness.tools.brand_kit_tool import BrandConfig
+
+        brand = BrandConfig.from_yaml_file(brand_path)
+    except Exception:
+        _BRAND_CACHE[cache_key] = (stamp, None)
+        return None  # Don't crash the session if brand.yaml is malformed.
+    if not brand.name and not brand.colors.primary and not brand.fonts.heading:
+        _BRAND_CACHE[cache_key] = (stamp, None)
+        return None  # Empty brand config — skip.
+    lines = ["# Brand Anchors (from brand.yaml)", ""]
+    if brand.name:
+        lines.append(f"- Channel: {brand.name}")
+    if brand.colors.primary or brand.colors.secondary or brand.colors.accent:
+        lines.append("- Colors:")
+        if brand.colors.primary:
+            lines.append(f"  - Primary: {brand.colors.primary}")
+        if brand.colors.secondary:
+            lines.append(f"  - Secondary: {brand.colors.secondary}")
+        if brand.colors.accent:
+            lines.append(f"  - Accent: {brand.colors.accent}")
+    if brand.fonts.heading or brand.fonts.body:
+        lines.append("- Fonts:")
+        if brand.fonts.heading:
+            lines.append(f"  - Heading: {brand.fonts.heading}")
+        if brand.fonts.body:
+            lines.append(f"  - Body: {brand.fonts.body}")
+    if brand.voice:
+        lines.append(f"- Voice: {brand.voice}")
+    if brand.music_style:
+        lines.append(f"- Music style: {brand.music_style}")
+    if brand.min_type_size:
+        lines.append(f"- Minimum type size: {brand.min_type_size}px")
+    if brand.safe_area:
+        lines.append(f"- Safe area: {brand.safe_area}px")
+    if brand.easing:
+        lines.append(f"- Easing: {brand.easing}")
+    lines.append("")
+    lines.append(
+        "All generated scenes MUST comply with these brand anchors. "
+        "Use the `brand_kit` tool with `action=drift` to get a per-project "
+        "creative drift that stays within this envelope."
+    )
+    section = "\n".join(lines)
+    _BRAND_CACHE[cache_key] = (stamp, section)
+    return section
+
+
 def build_runtime_system_prompt(
     settings: Settings,
     *,
@@ -142,6 +224,12 @@ def build_runtime_system_prompt(
 
     if not is_coordinator_mode():
         sections.append(_build_delegation_section())
+
+    # Brand anchors (from brand.yaml, when present) — injected for every
+    # mode and on EVERY prompt rebuild so per-turn refreshes never lose it.
+    brand_section = _build_brand_anchor_section(cwd)
+    if brand_section:
+        sections.append(brand_section)
 
     claude_md = load_claude_md_prompt(cwd)
     if claude_md:

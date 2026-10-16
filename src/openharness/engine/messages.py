@@ -46,6 +46,32 @@ class ToolUseBlock(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
 
 
+class ThinkingBlock(BaseModel):
+    """Extended-thinking output from Anthropic thinking models.
+
+    Anthropic requires these blocks (with their ``signature``) to be
+    preserved in the conversation history when ``thinking`` is enabled
+    and the preceding assistant turn contained ``tool_use`` — stripping
+    them makes the next request fail with a 400 ("a tool_use block must
+    be preceded by a thinking block"). They are carried verbatim and
+    never shown to the user.
+    """
+
+    type: Literal["thinking"] = "thinking"
+    thinking: str = ""
+    signature: str = ""
+
+
+class RedactedThinkingBlock(BaseModel):
+    """Encrypted thinking block returned for some safety-flagged turns.
+
+    Passed through verbatim for the same reason as :class:`ThinkingBlock`.
+    """
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = ""
+
+
 class ToolResultBlock(BaseModel):
     """Tool result content sent back to the model."""
 
@@ -57,7 +83,7 @@ class ToolResultBlock(BaseModel):
 
 
 ContentBlock = Annotated[
-    TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock,
+    TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | RedactedThinkingBlock,
     Field(discriminator="type"),
 ]
 
@@ -113,6 +139,9 @@ class ConversationMessage(BaseModel):
                     return False
                 if isinstance(block, (ImageBlock, ToolUseBlock, ToolResultBlock)):
                     return False
+                # Thinking blocks are NOT counted as useful content on
+                # their own — a message carrying only thinking is dropped
+                # by sanitize, exactly like an empty text message.
         return True
 
 
@@ -194,6 +223,21 @@ def serialize_content_block(block: ContentBlock) -> dict[str, Any]:
             "input": block.input,
         }
 
+    if isinstance(block, ThinkingBlock):
+        # Verbatim round-trip: the signature must be preserved or
+        # Anthropic rejects the history when thinking is enabled.
+        return {
+            "type": "thinking",
+            "thinking": block.thinking,
+            "signature": block.signature,
+        }
+
+    if isinstance(block, RedactedThinkingBlock):
+        return {
+            "type": "redacted_thinking",
+            "data": block.data,
+        }
+
     return {
         "type": "tool_result",
         "tool_use_id": block.tool_use_id,
@@ -210,6 +254,21 @@ def assistant_message_from_api(raw_message: Any) -> ConversationMessage:
         block_type = getattr(raw_block, "type", None)
         if block_type == "text":
             content.append(TextBlock(text=getattr(raw_block, "text", "")))
+        elif block_type == "thinking":
+            # Preserve extended-thinking blocks so multi-turn tool-use
+            # history stays valid when thinking is enabled. Without this
+            # the next request 400s ("tool_use block must be preceded by
+            # a thinking block").
+            content.append(
+                ThinkingBlock(
+                    thinking=getattr(raw_block, "thinking", "") or "",
+                    signature=getattr(raw_block, "signature", "") or "",
+                )
+            )
+        elif block_type == "redacted_thinking":
+            content.append(
+                RedactedThinkingBlock(data=getattr(raw_block, "data", "") or "")
+            )
         elif block_type == "tool_use":
             content.append(
                 ToolUseBlock(

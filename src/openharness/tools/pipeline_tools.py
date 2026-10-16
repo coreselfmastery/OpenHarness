@@ -286,13 +286,20 @@ class QAReviewTool(BaseTool):
             resolution = dict(getattr(rendering, "resolution_tiers", {}) or {}).get(
                 arguments.tier, ""
             )
-        verdicts = await reviewer.review_scenes(
-            scene_paths,
-            engine=arguments.engine,
-            tier=arguments.tier,
-            resolution=resolution or "640x360",
-            mode=arguments.mode,
-        )
+        try:
+            verdicts = await reviewer.review_scenes(
+                scene_paths,
+                engine=arguments.engine,
+                tier=arguments.tier,
+                resolution=resolution or "640x360",
+                mode=arguments.mode,
+            )
+        finally:
+            # The reviewer pools one httpx.AsyncClient for its lifetime
+            # (connection reuse across the review waves) — release it
+            # here so every qa_review tool call closes its own client
+            # instead of leaking it to the GC.
+            await reviewer.aclose()
 
         lines = [f"[qa_review] {len(verdicts)} scene(s) reviewed (model: {reviewer.stats()['model']})"]
         promote_results: list[str] = []
@@ -787,3 +794,309 @@ class CacheStatsTool(BaseTool):
             removed = store.prune_namespace("llm_semantic", arguments.keep)
             return ToolResult(output=f"Pruned semantic cache to {arguments.keep} entries (removed {removed}).")
         return ToolResult(output=f"Unknown action: {arguments.action}", is_error=True)
+
+
+# ======================================================================
+# Speed feature #2 — parallel_prompts (async batch executor)
+# ======================================================================
+
+class ParallelPromptsInput(BaseModel):
+    prompts: list[str] = Field(
+        description=(
+            "Independent prompts to run concurrently. Each gets its own "
+            "response; results come back in the same order. Prompts that "
+            "depend on each other's output do NOT belong here."
+        )
+    )
+    system: str | None = Field(
+        default=None,
+        description="Optional system prompt applied to every request.",
+    )
+    max_tokens: int = Field(default=2048, ge=1, le=200_000)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    concurrency: int | None = Field(
+        default=None,
+        ge=1,
+        le=32,
+        description="Max requests in flight at once (default: settings.inference.batch_concurrency, 8).",
+    )
+    retries: int = Field(default=1, ge=0, le=5, description="Retry rounds for failed prompts.")
+    labels: list[str] | None = Field(
+        default=None,
+        description="Optional labels per prompt (same length) used in the report.",
+    )
+
+
+class ParallelPromptsTool(BaseTool):
+    name = "parallel_prompts"
+    description = (
+        "Run N independent LLM prompts CONCURRENTLY through the async batch "
+        "executor (default 8 in flight, semaphore-bounded) instead of one at "
+        "a time — an 8x throughput win for fan-out work like writing 50 "
+        "title cards, naming scenes, or summarizing documents in bulk. "
+        "Every response is recorded in the cost dashboard; failed prompts "
+        "retry (configurable) and never lose the successful ones. Use this "
+        "whenever the prompts don't depend on each other."
+    )
+    input_model = ParallelPromptsInput
+
+    def is_read_only(self, arguments: ParallelPromptsInput) -> bool:
+        return True
+
+    async def execute(self, arguments: ParallelPromptsInput, context: ToolExecutionContext) -> ToolResult:
+
+        from openharness.services.batch_executor import (
+            AsyncBatchExecutor,
+            ItemFailure,
+        )
+        from openharness.services.cost_dashboard import get_cost_dashboard
+
+        if not arguments.prompts:
+            return ToolResult(output="No prompts provided.", is_error=True)
+
+        # Endpoint resolution — same precedence as the QA reviewer:
+        # scene_gen config, then QA settings, then the primary model.
+        metadata = context.metadata or {}
+        settings = metadata.get("settings")
+        scene_gen = metadata.get("scene_gen_config") or {}
+        qa = getattr(settings, "qa", None) if settings is not None else None
+        base_url = (
+            (getattr(qa, "base_url", "") or "")
+            or scene_gen.get("base_url")
+            or (getattr(settings, "base_url", "") or "")
+        ).strip()
+        api_key = (
+            (getattr(qa, "api_key", "") or "")
+            or scene_gen.get("api_key")
+            or (getattr(settings, "api_key", "") or "")
+        ).strip()
+        model = (
+            (getattr(qa, "model", "") or "")
+            or scene_gen.get("model")
+            or (getattr(settings, "model", "") or "")
+        ).strip()
+        if not (base_url and api_key and model):
+            return ToolResult(
+                output=(
+                    "parallel_prompts needs an LLM endpoint: configure "
+                    "settings.scene_gen / settings.qa / the primary model "
+                    "(model + api_key + base_url)."
+                ),
+                is_error=True,
+            )
+        if not base_url.rstrip("/").endswith(("v1", "api")):
+            base_url = base_url.rstrip("/") + "/v1"
+
+        concurrency = arguments.concurrency
+        if concurrency is None:
+            inference = getattr(settings, "inference", None) if settings is not None else None
+            concurrency = int(getattr(inference, "batch_concurrency", 8) or 8)
+        executor = AsyncBatchExecutor(concurrency)
+
+        dashboard = get_cost_dashboard()
+        labels = arguments.labels or []
+        results: list[Any] = []
+
+        # ONE pooled HTTP client for the whole batch (and its retries):
+        # per-prompt clients would pay a fresh TCP+TLS handshake each —
+        # exactly the overhead the batch executor exists to amortize.
+        import httpx
+
+        timeout = float(getattr(settings, "timeout", 120.0) or 120.0) if settings is not None else 120.0
+        shared_client = httpx.AsyncClient(timeout=max(timeout, 60.0))
+
+        async def _one(prompt: str, index: int) -> str:
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": (
+                    [{"role": "system", "content": arguments.system}, {"role": "user", "content": prompt}]
+                    if arguments.system
+                    else [{"role": "user", "content": prompt}]
+                ),
+                "max_tokens": arguments.max_tokens,
+                "temperature": arguments.temperature,
+            }
+            headers = {"Authorization": f"Bearer {api_key}"}
+            response = await shared_client.post(
+                f"{base_url}/chat/completions", json=payload, headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError(f"no choices in response: {str(data)[:200]}")
+            content = str((choices[0].get("message") or {}).get("content") or "")
+            usage = data.get("usage") or {}
+            if usage:
+                dashboard.record(
+                    model=model,
+                    input_tokens=int(usage.get("prompt_tokens") or 0),
+                    output_tokens=int(usage.get("completion_tokens") or 0),
+                    source="parallel_prompts",
+                )
+            return content
+
+        import time as _time
+
+        started = _time.monotonic()
+        try:
+            results = await executor.run_with_retries(
+                arguments.prompts,
+                _one,
+                retries=arguments.retries,
+            )
+        except Exception as exc:  # noqa: BLE001 - tool must always report
+            return ToolResult(output=f"parallel_prompts failed: {exc}", is_error=True)
+        finally:
+            aclose = getattr(shared_client, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001 - cleanup must not mask results
+                    pass
+        elapsed = _time.monotonic() - started
+
+        succeeded = [r for r in results if not isinstance(r, ItemFailure)]
+        failed = [r for r in results if isinstance(r, ItemFailure)]
+        lines = [
+            f"[parallel_prompts] {len(succeeded)}/{len(arguments.prompts)} prompts "
+            f"succeeded in {elapsed:.1f}s (concurrency {executor.concurrency}, "
+            f"{executor.stats.items_run} calls incl. retries)."
+        ]
+        for index, result in enumerate(results):
+            label = labels[index] if index < len(labels) else f"#{index + 1}"
+            if isinstance(result, ItemFailure):
+                lines.append(f"  FAIL  {label}: {result.error}")
+        report = executor.report()
+        report["elapsed_seconds"] = round(elapsed, 2)
+        report["succeeded"] = len(succeeded)
+        report["failed"] = len(failed)
+        return ToolResult(
+            output="\n".join(lines),
+            metadata={
+                "results": [
+                    r.error if isinstance(r, ItemFailure) else str(r) for r in results
+                ],
+                "executor": report,
+            },
+        )
+
+
+# ======================================================================
+# Speed feature #6 — cost_report (cost dashboard)
+# ======================================================================
+
+class CostReportInput(BaseModel):
+    action: str = Field(
+        default="summary",
+        description="summary | models | scenes | recent | clear",
+    )
+    project: str | None = Field(
+        default=None,
+        description="Filter/report by project name (uses the per-project aggregate).",
+    )
+    scenes_total: int | None = Field(
+        default=None,
+        ge=1,
+        description="Total scenes in the current project (enables cost projection).",
+    )
+    scenes_done: int | None = Field(
+        default=None,
+        ge=0,
+        description="Scenes completed so far (enables cost projection).",
+    )
+    limit: int = Field(default=15, ge=1, le=100, description="Entries for 'recent'.")
+
+
+class CostReportTool(BaseTool):
+    name = "cost_report"
+    description = (
+        "Real-time cost dashboard: every LLM call is priced from a "
+        "per-model pricing table and aggregated in SQLite (survives "
+        "restarts). See total spend, cost by model / by scene / by "
+        "project, recent calls, and a projected total when you pass "
+        "scenes_total + scenes_done. Prices are estimates and "
+        "user-overridable (OPENHARNESS_PRICING_JSON)."
+    )
+    input_model = CostReportInput
+
+    def is_read_only(self, arguments: CostReportInput) -> bool:
+        return arguments.action != "clear"
+
+    async def execute(self, arguments: CostReportInput, context: ToolExecutionContext) -> ToolResult:
+        from openharness.services.cost_dashboard import get_cost_dashboard
+
+        dashboard = get_cost_dashboard()
+        action = arguments.action.strip().lower()
+        if action == "clear":
+            dashboard.clear()
+            return ToolResult(output="Cost dashboard cleared (memory + persisted aggregates).")
+
+        if action == "recent":
+            rows = dashboard.recent(limit=arguments.limit)
+            if not rows:
+                return ToolResult(output="No calls recorded yet.", metadata={"recent": []})
+            lines = ["[cost_report] recent calls (newest first)"]
+            for row in rows:
+                price_note = "" if row.get("priced") else "  (unpriced model)"
+                scene_note = f"  scene={row['scene']}" if row.get("scene") else ""
+                lines.append(
+                    f"  {row['model']}: {row['input_tokens']} in / {row['output_tokens']} out "
+                    f"-> ${row['cost_usd']:.4f}{price_note}{scene_note} [{row.get('source', 'llm')}]"
+                )
+            return ToolResult(output="\n".join(lines), metadata={"recent": rows})
+
+        summary = dashboard.summary(
+            project=arguments.project,
+            scenes_total=arguments.scenes_total,
+            scenes_done=arguments.scenes_done,
+        )
+        if action == "models":
+            lines = [f"[cost_report] by model — total ${summary['total_cost_usd']:.4f} "
+                     f"over {summary['total_calls']} calls"]
+            for model, agg in summary["models"].items():
+                lines.append(
+                    f"  {model}: {agg['calls']} calls, {agg['input_tokens']} in / "
+                    f"{agg['output_tokens']} out -> ${agg['cost_usd']:.4f}"
+                )
+            if summary["unpriced_calls"]:
+                lines.append(
+                    f"  ({summary['unpriced_calls']} calls used models with no pricing entry — "
+                    f"add OPENHARNESS_PRICING_JSON to price them)"
+                )
+            return ToolResult(output="\n".join(lines), metadata={"models": summary["models"]})
+
+        if action == "scenes":
+            scenes = summary["scenes"]
+            if not scenes:
+                return ToolResult(output="No per-scene costs recorded yet "
+                                         "(tools label records with scene=<name>).",
+                                  metadata={"scenes": {}})
+            lines = [f"[cost_report] by scene — {len(scenes)} scene(s)"]
+            for scene, agg in list(scenes.items())[:50]:
+                lines.append(f"  {scene}: {agg['calls']} calls -> ${agg['cost_usd']:.4f}")
+            return ToolResult(output="\n".join(lines), metadata={"scenes": scenes})
+
+        # summary (default)
+        lines = [
+            f"[cost_report] ${summary['total_cost_usd']:.4f} over {summary['total_calls']} LLM calls "
+            f"({summary['total_input_tokens']} in / {summary['total_output_tokens']} out tokens)",
+        ]
+        if summary.get("project") is not None:
+            lines.append(f"  project {summary['project']}: ${summary['project_cost_usd']:.4f}")
+        for model, agg in list(summary["models"].items())[:5]:
+            lines.append(
+                f"  {model}: {agg['calls']} calls -> ${agg['cost_usd']:.4f}"
+            )
+        if summary["unpriced_calls"]:
+            lines.append(
+                f"  note: {summary['unpriced_calls']} calls on unpriced models "
+                f"(not included in totals; set OPENHARNESS_PRICING_JSON)"
+            )
+        if "projected_total_usd" in summary:
+            lines.append(
+                f"  projection: {summary['scenes_done']}/{summary['scenes_total']} scenes done, "
+                f"{summary['scenes_remaining']} remaining -> projected total "
+                f"${summary['projected_total_usd']:.4f}"
+            )
+        return ToolResult(output="\n".join(lines), metadata={"summary": summary})

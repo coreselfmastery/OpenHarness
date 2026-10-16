@@ -47,6 +47,12 @@ class AuditLog:
         self._lock = threading.Lock()
         self.entries_written = 0
         self._dropped = 0
+        # Persistent append handle — one open() per process (reopened on
+        # day rollover) instead of one open/close syscall pair per entry.
+        # The audit log records every tool and LLM call, so per-entry file
+        # opens were measurable hot-path overhead.
+        self._fh = None
+        self._fh_date = ""
         if not enabled:
             self._available = False
             return
@@ -78,16 +84,55 @@ class AuditLog:
             "detail": _bounded(detail or {}),
         }
         line = json.dumps(entry, separators=(",", ":"), default=str)
-        path = self._file_for_today()
         try:
             with self._lock:
-                with path.open("a", encoding="utf-8") as fh:
+                fh = self._ensure_handle()
+                if fh is not None:
                     fh.write(line + "\n")
+                    fh.flush()
                 self.entries_written += 1
         except OSError as exc:
             self._dropped += 1
             if self._dropped <= 3:
                 log.warning("audit write failed: %s", exc)
+            # Self-heal: a broken handle (disk full, file unlinked by log
+            # rotation, NFS hiccup) would otherwise fail EVERY later
+            # write too. Drop it so the next record() reopens fresh.
+            try:
+                with self._lock:
+                    if self._fh is not None:
+                        try:
+                            self._fh.close()
+                        except OSError:
+                            pass
+                        self._fh = None
+            except Exception:  # noqa: BLE001 - never propagate from audit
+                pass
+
+    def _ensure_handle(self):
+        """Return the (day-scoped) append handle, reopening on rollover."""
+        today = time.strftime("%Y%m%d")
+        if self._fh is not None and today != self._fh_date:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+        if self._fh is None:
+            self._fh = (self._dir / f"audit-{today}.jsonl").open("a", encoding="utf-8")
+            self._fh_date = today
+        return self._fh
+
+    def close(self) -> None:
+        """Close the persistent handle (safe to call repeatedly)."""
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
 
     def record_tool_call(
         self,
@@ -133,6 +178,12 @@ class AuditLog:
 
     def _file_for_today(self) -> Path:
         return self._dir / f"audit-{time.strftime('%Y%m%d')}.jsonl"
+
+    def __del__(self) -> None:  # best-effort; explicit close() preferred
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
 

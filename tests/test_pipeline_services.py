@@ -626,16 +626,27 @@ async def test_inference_pipeline_semantic_cache_hit_skips_transport(tmp_path: P
 
 
 def test_wrap_client_identity_without_inference_settings():
-    from openharness.services.llm_pipeline import wrap_client_with_inference_pipeline
+    from openharness.services.llm_pipeline import (
+        UsageTrackingClient,
+        wrap_client_with_inference_pipeline,
+    )
 
     transport = _FakeTransport()
     settings = SimpleNamespace()  # no .inference attribute
-    assert wrap_client_with_inference_pipeline(settings, transport) is transport
+    wrapped = wrap_client_with_inference_pipeline(settings, transport)
+    # Cost tracking is always on (pure observability): the only wrapper
+    # applied with no inference settings is the usage tracker, which is
+    # a transparent passthrough to the original transport.
+    if isinstance(wrapped, UsageTrackingClient):
+        assert wrapped._inner is transport
+    else:
+        assert wrapped is transport
 
 
 def test_wrap_client_applies_pipeline_when_features_on():
     from openharness.services.llm_pipeline import (
         InferencePipelineClient,
+        UsageTrackingClient,
         wrap_client_with_inference_pipeline,
     )
 
@@ -643,7 +654,12 @@ def test_wrap_client_applies_pipeline_when_features_on():
     settings = SimpleNamespace(inference=SimpleNamespace(prefix_caching=True))
     wrapped = wrap_client_with_inference_pipeline(settings, transport)
     assert isinstance(wrapped, InferencePipelineClient)
-    assert wrapped._inner is transport
+    # The usage tracker sits between the pipeline wrapper and the
+    # transport (inside the semantic cache so free replays aren't billed).
+    if isinstance(wrapped._inner, UsageTrackingClient):
+        assert wrapped._inner._inner is transport
+    else:
+        assert wrapped._inner is transport
 
 
 # ======================================================================

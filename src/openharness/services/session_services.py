@@ -282,7 +282,19 @@ async def _close_persistent_store() -> None:
 
 
 async def _final_audit_entry() -> None:
-    get_audit_log().record("session.close", {"pid": __import__("os").getpid()})
+    audit = get_audit_log()
+    audit.record("session.close", {"pid": __import__("os").getpid()})
+    # Close the persistent append handle so the file is released cleanly.
+    audit.close()
+    # Flush the cost dashboard's in-memory aggregates to the persistent
+    # store so a session kill loses at most the last flush interval.
+    try:
+        from openharness.services.cost_dashboard import _DASHBOARD
+
+        if _DASHBOARD is not None:
+            _DASHBOARD.flush(force=True)
+    except Exception as exc:
+        log.debug("cost dashboard flush: %s", exc)
 
 
 async def shutdown_session_services() -> None:

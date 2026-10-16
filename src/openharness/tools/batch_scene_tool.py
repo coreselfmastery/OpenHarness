@@ -210,47 +210,96 @@ class BatchSceneTool(BaseTool):
                 },
             )
 
-        # Step 3: Validate + write each scene
+        # Step 3: Validate + write each scene.
+        #
+        # Speed (async batch executor): the first lint pass is pure CPU
+        # (no LLM) and runs inline; scenes that fail it get their retry
+        # LLM calls fanned out CONCURRENTLY (semaphore-bounded, default
+        # 8 in flight) instead of one-at-a-time — with a 10-scene batch
+        # where 3 need fixes, the retries overlap instead of serializing
+        # behind each other. Writes stay sequential and scene-ordered.
         written: list[str] = []
         failed: list[dict[str, Any]] = []
-        for scene in parse_result.scenes:
-            # Retry loop for individual scenes
-            success = False
-            last_error = ""
-            for attempt in range(arguments.max_retries_per_scene + 1):
-                # Determine the code to write (retry on lint failure)
-                if attempt == 0:
-                    code_to_write = scene.code
-                else:
-                    # Retry: call LLM for just this scene
-                    try:
-                        code_to_write = await self._retry_single_scene(
-                            arguments, config, context, scene, last_error
-                        )
-                    except Exception as exc:
-                        last_error = str(exc)
-                        log.warning("scene %s retry %d failed: %s", scene.index, attempt, exc)
-                        continue
 
-                # Lint check
-                lint_ok, lint_error = lint_scene_code(code_to_write, arguments.file_extension)
-                if lint_ok:
-                    success = True
-                    break
-                last_error = lint_error
+        @dataclass
+        class _SceneOutcome:
+            scene: Any
+            code: str
+            error: str = ""
+
+        # Pass 1: lint every scene's first-shot code (no LLM calls).
+        outcomes: list[_SceneOutcome] = []
+        retry_jobs: list[_SceneOutcome] = []
+        for scene in parse_result.scenes:
+            lint_ok, lint_error = lint_scene_code(scene.code, arguments.file_extension)
+            if lint_ok:
+                outcomes.append(_SceneOutcome(scene=scene, code=scene.code))
+            else:
+                job = _SceneOutcome(scene=scene, code=scene.code, error=lint_error)
+                outcomes.append(job)  # placeholder slot; fixed by retries
+                retry_jobs.append(job)
                 log.warning(
-                    "scene %s lint failed (attempt %d/%d): %s",
-                    scene.index, attempt + 1, arguments.max_retries_per_scene + 1, lint_error,
+                    "scene %s lint failed on first shot: %s", scene.index, lint_error
                 )
 
-            if not success:
+        # Pass 2: concurrent per-scene retries (each job runs its full
+        # retry chain — up to max_retries_per_scene LLM redos, stopping
+        # as soon as lint passes).
+        if retry_jobs:
+            from openharness.services.batch_executor import (
+                AsyncBatchExecutor,
+                ItemFailure,
+            )
+
+            settings = (context.metadata or {}).get("settings")
+            inference = getattr(settings, "inference", None) if settings is not None else None
+            concurrency = int(getattr(inference, "batch_concurrency", 8) or 8)
+            executor = AsyncBatchExecutor(concurrency)
+
+            async def _fix_scene(job: _SceneOutcome, _index: int) -> _SceneOutcome:
+                scene = job.scene
+                last_error = job.error
+                code = job.code
+                for _attempt in range(arguments.max_retries_per_scene):
+                    try:
+                        code = await self._retry_single_scene(
+                            arguments, config, context, scene, last_error
+                        )
+                    except Exception as exc:  # noqa: BLE001 - retry chain continues
+                        last_error = str(exc)
+                        continue
+                    lint_ok, lint_error = lint_scene_code(code, arguments.file_extension)
+                    if lint_ok:
+                        return _SceneOutcome(scene=scene, code=code)
+                    last_error = lint_error
+                return _SceneOutcome(scene=scene, code=code, error=last_error)
+
+            results = await executor.run(retry_jobs, _fix_scene, label="batch_scene_retries")
+            fixed: dict[int, _SceneOutcome] = {}
+            for job, result in zip(retry_jobs, results):
+                slot = next(i for i, o in enumerate(outcomes) if o is job)
+                if isinstance(result, ItemFailure):
+                    # The retry chain itself blew up (executor-level);
+                    # surface the original lint error plus the failure.
+                    fixed[slot] = _SceneOutcome(
+                        scene=job.scene, code=job.code,
+                        error=f"{job.error}; retry failed: {result.error}",
+                    )
+                else:
+                    fixed[slot] = result
+            for slot, outcome in fixed.items():
+                outcomes[slot] = outcome
+
+        # Pass 3: write files in original scene order.
+        for outcome in outcomes:
+            scene = outcome.scene
+            if outcome.error:
                 failed.append({
                     "scene_index": scene.index,
                     "file": scene.file,
-                    "error": last_error,
+                    "error": outcome.error,
                 })
                 continue
-
             # Write the file. The filename comes from the LLM response, so
             # it is untrusted: reject anything that tries to escape
             # output_dir (path separators, "..", absolute paths, null
@@ -271,7 +320,7 @@ class BatchSceneTool(BaseTool):
                 continue
             file_path = output_dir / filename
             try:
-                file_path.write_text(code_to_write, encoding="utf-8")
+                file_path.write_text(outcome.code, encoding="utf-8")
                 try:
                     written.append(str(file_path.relative_to(context.cwd)))
                 except ValueError:

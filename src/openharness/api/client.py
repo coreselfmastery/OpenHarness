@@ -273,6 +273,15 @@ class AnthropicApiClient:
                 else:
                     budget = max(min_budget, min(request.thinking_budget, max_allowed))
                     params["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        # Thinking/history consistency: when thinking is NOT enabled for
+        # this request (disabled, budget 0, or an unsupported model) but
+        # the history still contains thinking/redacted_thinking blocks
+        # from earlier turns that ran with thinking on, Anthropic rejects
+        # the request. Strip them from the outbound messages.
+        if "thinking" not in params:
+            params["messages"] = [
+                _strip_thinking_blocks(message) for message in params["messages"]
+            ]
         if self._claude_oauth:
             params["betas"] = claude_oauth_betas()
             params["metadata"] = {
@@ -342,6 +351,36 @@ def _model_supports_anthropic_thinking(model_lower: str) -> bool:
     if "/" in model_lower:
         model_lower = model_lower.rsplit("/", 1)[-1]
     return any(model_lower.startswith(prefix) for prefix in _ANTHROPIC_THINKING_MODEL_PREFIXES)
+
+
+def _strip_thinking_blocks(message: dict[str, Any]) -> dict[str, Any]:
+    """Drop thinking/redacted_thinking blocks from one outbound message.
+
+    Used when the request does NOT enable thinking: Anthropic rejects
+    histories that still carry thinking blocks from earlier turns that
+    ran with thinking on ("thinking blocks provided when thinking is
+    disabled"). Returns the message unchanged when it has no thinking
+    blocks so the common path allocates nothing.
+    """
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    if not any(
+        isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking")
+        for block in content
+    ):
+        return message
+    filtered = [
+        block
+        for block in content
+        if not (isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"))
+    ]
+    # An assistant message left completely empty by the strip would itself
+    # be invalid — keep at least an empty text block so the history shape
+    # stays acceptable.
+    if not filtered:
+        filtered = [{"type": "text", "text": ""}]
+    return {**message, "content": filtered}
 
 
 def _translate_api_error(exc: APIError) -> OpenHarnessApiError:

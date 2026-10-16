@@ -309,8 +309,15 @@ def configure_tool_cache_from_settings(settings: Any) -> None:
     filesystem reads eventually expire even without a mutating call.
     """
     if getattr(settings, "tool_cache_enabled", False):
-        max_entries = int(getattr(settings, "tool_cache_max_entries", 256) or 256)
-        ttl_seconds = float(getattr(settings, "tool_cache_ttl_seconds", 3600) or 3600)
+        max_raw = getattr(settings, "tool_cache_max_entries", 256)
+        # 0 is a legitimate value (cache nothing) — only a missing/None
+        # field falls back to the default.
+        max_entries = 256 if max_raw is None else max(0, int(max_raw))
+        ttl_raw = getattr(settings, "tool_cache_ttl_seconds", 3600)
+        # 0 means "never expire" (documented in MIGRATION.md: rely on
+        # mutation-based invalidation only). The previous ``or 3600``
+        # coerced 0 -> 3600, silently breaking the documented behaviour.
+        ttl_seconds = 3600.0 if ttl_raw is None else max(0.0, float(ttl_raw))
         enable_tool_cache(max_entries=max_entries, ttl_seconds=ttl_seconds)
     else:
         disable_tool_cache()

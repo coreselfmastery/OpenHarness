@@ -469,7 +469,19 @@ def score_creative_originality(
 _HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}\b")
 _FONT_FAMILY_RE = re.compile(r"font-?family\s*[:=]\s*['\"]?([^'\";,\n]+)", re.IGNORECASE)
 _FONT_SIZE_RE = re.compile(r"font-?size\s*[:=]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
-_SAFE_AREA_RE = re.compile(r"(?:left|top|right|bottom|x|y)\s*[:=]\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+# Safe-area positioning check. The negative lookbehind ``(?<![\w$-])``
+# is essential: without it the bare-key alternation matched SUBSTRINGS of
+# unrelated property names — ``opacity: 0.5`` (…y: 0.5), ``zIndex: 10``
+# (…x: 10), ``paddingTop: 12`` / ``marginRight: 8`` (top:/right:) — and
+# reported them as safe-area violations. The lookbehind requires the key
+# to start a fresh identifier (preceded by whitespace, ``{``, ``(``, ``.``
+# etc.), while still allowing member access like ``position.x = 5``.
+# Hyphen is excluded so CSS shorthands (``margin-left: 8px``) don't match.
+# An optional quote allows JS string values (``x: '40'``).
+_SAFE_AREA_RE = re.compile(
+    r"(?<![\w$-])(?:left|top|right|bottom|x|y)\s*[:=]\s*['\"]?\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 
 
 def _extract_hex_colors(code: str) -> list[str]:
