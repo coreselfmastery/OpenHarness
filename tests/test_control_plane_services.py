@@ -1218,8 +1218,13 @@ def test_progress_eta_needs_observed_durations():
     tracker = get_progress_tracker()
     tracker.mark("s", "generating")
     assert tracker.eta_seconds() is None  # nothing observed yet
-    # Simulate one observed generate cycle: inject fake durations.
+    # Simulate one observed WORK cycle: the ETA model only reads the
+    # work stages (generating/rendering/qa) — the passive waypoint
+    # stages (generated/rendered/approved) are millisecond transitions
+    # and must not produce an ETA by themselves.
     tracker._stage_durations["generated"].append(2.0)
+    assert tracker.eta_seconds() is None  # waypoint durations don't count
+    tracker._stage_durations["generating"].append(2.0)
     assert tracker.eta_seconds() is not None and tracker.eta_seconds() > 0
     # All-terminal -> zero.
     tracker.mark("s", "generated")

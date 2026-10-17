@@ -1106,11 +1106,20 @@ async def test_prefetch_warms_tool_cache_for_assets(tmp_path: Path):
         assert report.audio_generated == []
         cache = get_tool_cache()
         assert cache is not None
+        # The cache key must match the RAW tool input the model sends for
+        # read_file — FileReadToolInput spells the argument ``path``.
+        # Both the minimal call shape and the fully-defaulted one must hit.
+        cached = cache.get("read_file", {"path": str(asset)})
+        assert cached is not None, "minimal call shape {path} must hit the warmed cache"
         cached = cache.get(
-            "read_file", {"file_path": str(asset), "offset": 0, "limit": 200}
+            "read_file", {"path": str(asset), "offset": 0, "limit": 200}
         )
-        assert cached is not None
-        assert "pretend-image-bytes" in cached["output"]
+        assert cached is not None, "defaulted call shape {path,offset,limit} must hit"
+        # The warmed value must be byte-identical to a real read_file call
+        # (numbered lines), not raw file content.
+        assert cached["output"].splitlines()[0].endswith("\tpretend-image-bytes")
+        # The old buggy key (``file_path``) must NOT exist.
+        assert cache.get("read_file", {"file_path": str(asset)}) is None
     finally:
         reset_tool_cache()
 

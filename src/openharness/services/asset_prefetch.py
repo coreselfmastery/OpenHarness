@@ -235,15 +235,7 @@ class AssetPrefetcher:
                     report.skipped.append(f"{asset.name} (unreadable)")
                     continue
                 if tool_cache is not None and tool_cache.is_cacheable("read_file"):
-                    tool_cache.put(
-                        "read_file",
-                        {"file_path": str(asset), "offset": 0, "limit": 200},
-                        {
-                            "output": content[:40_000],
-                            "is_error": False,
-                            "metadata": {"prefetched": True},
-                        },
-                    )
+                    self._warm_read_file_cache(tool_cache, asset, content, cwd=cwd)
                     report.files_read.append(str(asset))
             # 2. Queue voiceover audio in the background.
             if self._audio is not None:
@@ -252,6 +244,47 @@ class AssetPrefetcher:
                     self._audio.run_in_background(line, out)
                     report.audio_generated.append(str(out))
         return report
+
+    @staticmethod
+    def _warm_read_file_cache(tool_cache: Any, asset: Path, content: str, *, cwd: Path) -> None:
+        """Warm the tool cache so a later ``read_file`` hits.
+
+        The cache key is built from the RAW tool-input dict the model
+        sends, and ``FileReadToolInput`` spells the argument ``path``
+        (not ``file_path``) — so the entry must be stored under
+        ``{"path": ...}``. Both common call shapes are warmed (the
+        minimal path-only call and the fully-defaulted one), and both
+        path forms (absolute, and cwd-relative for assets under the
+        project root).
+
+        The cached value replicates the tool's ACTUAL output format
+        (``{:>6}\t{line}`` numbered lines, first ``limit`` lines), so a
+        cache hit is byte-identical to a real read.
+        """
+        lines = content.splitlines()
+        selected = lines[0:200]
+        output = "\n".join(f"{index + 1:>6}\t{line}" for index, line in enumerate(selected))
+        if not output:
+            return
+        result = {
+            "output": output,
+            "is_error": False,
+            "metadata": {"prefetched": True},
+        }
+        path_forms = [str(asset)]
+        try:
+            relative = asset.relative_to(cwd)
+            if str(relative) != str(asset):
+                path_forms.append(str(relative))
+        except ValueError:
+            pass  # asset outside cwd — only the absolute form applies
+        for form in path_forms:
+            tool_cache.put("read_file", {"path": form}, dict(result))
+            tool_cache.put(
+                "read_file",
+                {"path": form, "offset": 0, "limit": 200},
+                dict(result),
+            )
 
 
 _READS_RE = None

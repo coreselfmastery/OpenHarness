@@ -1,10 +1,18 @@
-"""Small stdio MCP server used by integration tests."""
+"""Small stdio MCP server used by integration tests.
+
+Compatible with BOTH mcp 1.x and 2.x: the SDK renamed ``FastMCP`` to
+``MCPServer`` (``mcp.server.mcpserver``) in 2.0. Import whichever the
+installed version provides.
+"""
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
+except ImportError:  # mcp 2.x — FastMCP was renamed to MCPServer
+    from mcp.server.mcpserver import MCPServer
 
-server = FastMCP("fixture-demo")
+server = MCPServer("fixture-demo")
 
 
 @server.tool()

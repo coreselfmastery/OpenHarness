@@ -66,6 +66,14 @@ class QueryEngine:
         self._tool_metadata = tool_metadata or {}
         self._settings = settings
         self._messages: list[ConversationMessage] = []
+        # Rollback-aware turn accounting (#37). ``rollback_messages`` can
+        # fire MID-TURN (the checkpoint tool runs inside the query loop,
+        # which operates on a COPY of the history). Without this tracking,
+        # ``submit_message`` would blindly re-adopt that pre-rollback copy
+        # at AssistantTurnComplete and silently wipe the restore.
+        self._messages_version = 0
+        self._active_query_messages: list[ConversationMessage] | None = None
+        self._rollback_tail_position = 0
         self._cost_tracker = CostTracker()
         # Waves 2-6 control plane (#26-#40): the shared control bus (kill
         # switch / pause gate / watchdog / injected messages) and the
@@ -115,8 +123,43 @@ class QueryEngine:
 
         The internal list object is mutated (not rebound) so any
         references held by the query loop stay valid.
+
+        When a rollback lands MID-TURN, the in-flight query loop keeps
+        running on its own copy of the (pre-rollback) history. The turn's
+        adoption step (:meth:`_adopt_query_messages`) must therefore
+        know where that copy stood when the rollback happened, so it can
+        keep the restored history as the base and preserve only the
+        post-rollback tail (the tool result + final answer the user
+        already saw streamed) instead of resurrecting the abandoned
+        branch.
         """
         self._messages[:] = list(messages)
+        self._messages_version += 1
+        active = self._active_query_messages
+        self._rollback_tail_position = len(active) if active is not None else len(self._messages)
+
+    def _adopt_query_messages(
+        self,
+        query_messages: list[ConversationMessage],
+        *,
+        version_at_start: int,
+    ) -> None:
+        """Adopt the turn's working copy back into the engine history.
+
+        No mid-turn rollback: the copy IS the new history (unchanged
+        behaviour). Mid-turn rollback: keep the restored history as the
+        base and append only the messages generated after the rollback
+        point, so the restore survives the turn. Orphaned tool results
+        in that tail (their ``tool_use`` lived on the abandoned branch)
+        are stripped by ``sanitize_conversation_messages``.
+        """
+        if self._messages_version == version_at_start:
+            self._messages = list(query_messages)
+            return
+        tail = query_messages[self._rollback_tail_position :]
+        self._messages = sanitize_conversation_messages(
+            list(self._messages) + list(tail)
+        )
 
     @property
     def cwd(self) -> Path:
@@ -330,14 +373,21 @@ class QueryEngine:
         coordinator_context = self._build_coordinator_context_message()
         if coordinator_context is not None:
             query_messages.append(coordinator_context)
+        # Rollback-aware adoption (#37): a checkpoint restore fired by a
+        # tool DURING this query must not be clobbered when the turn
+        # completes. Track the working copy + the history version it
+        # started from.
+        version_at_start = self._messages_version
+        self._active_query_messages = query_messages
         try:
             async for event, usage in run_query(context, query_messages):
                 if isinstance(event, AssistantTurnComplete):
-                    self._messages = list(query_messages)
+                    self._adopt_query_messages(query_messages, version_at_start=version_at_start)
                 if usage is not None:
                     self._cost_tracker.add(usage)
                 yield event
         finally:
+            self._active_query_messages = None
             await self._update_session_memory()
             await self._extract_durable_memories()
             self._schedule_auto_dream()
@@ -404,9 +454,20 @@ class QueryEngine:
             tool_timeout_seconds=self._tool_timeout_seconds,
             checkpoint_interval_turns=self._checkpoint_interval_turns,
         )
-        async for event, usage in run_query(context, self._messages):
-            if usage is not None:
-                self._cost_tracker.add(usage)
-            yield event
-        await self._update_session_memory()
-        await self._extract_durable_memories()
+        # Same rollback-aware pattern as submit_message: run the query on
+        # a COPY so a mid-turn checkpoint restore replaces self._messages
+        # without yanking the list out from under the in-flight loop.
+        query_messages = list(self._messages)
+        version_at_start = self._messages_version
+        self._active_query_messages = query_messages
+        try:
+            async for event, usage in run_query(context, query_messages):
+                if isinstance(event, AssistantTurnComplete):
+                    self._adopt_query_messages(query_messages, version_at_start=version_at_start)
+                if usage is not None:
+                    self._cost_tracker.add(usage)
+                yield event
+        finally:
+            self._active_query_messages = None
+            await self._update_session_memory()
+            await self._extract_durable_memories()

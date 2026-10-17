@@ -27,6 +27,7 @@ from openharness.tools.list_mcp_resources_tool import ListMcpResourcesTool
 from openharness.tools.lsp_tool import LspTool
 from openharness.tools.mcp_auth_tool import McpAuthTool
 from openharness.tools.mcp_tool import McpToolAdapter
+from openharness.tools.minicpm_vlm_tool import MiniCPMVLMTool
 from openharness.tools.notebook_edit_tool import NotebookEditTool
 from openharness.tools.pipeline_tools import (
     AudioGenTool,
@@ -41,6 +42,7 @@ from openharness.tools.pipeline_tools import (
     RenderScenesTool,
     ServerConfigTool,
 )
+from openharness.tools.pixel_qa_tool import PixelQATool
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 from openharness.tools.remote_trigger_tool import RemoteTriggerTool
 from openharness.tools.send_message_tool import SendMessageTool
@@ -130,6 +132,9 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         # Speed wave 2: async batch executor + cost dashboard
         ParallelPromptsTool(),
         CostReportTool(),
+        # Video QA: deterministic pixel inspection + local MiniCPM-V 4.5 VLM
+        PixelQATool(),
+        MiniCPMVLMTool(),
     ):
         registry.register(tool)
     if mcp_manager is not None:

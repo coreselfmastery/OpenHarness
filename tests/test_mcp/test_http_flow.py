@@ -6,7 +6,16 @@ from pathlib import Path
 
 import httpx
 import pytest
-from mcp.server.fastmcp import FastMCP
+
+try:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP
+
+    _MCP_2 = False
+except ImportError:  # mcp 2.x — FastMCP was renamed to MCPServer
+    from mcp.server.mcpserver import MCPServer as FastMCP
+
+    _MCP_2 = True
+
 from mcp.server.transport_security import TransportSecuritySettings
 
 import openharness.mcp.client as client_module
@@ -18,20 +27,33 @@ from openharness.tools.base import ToolExecutionContext
 
 @pytest.mark.asyncio
 async def test_http_mcp_manager_connects_and_executes_in_process_server(monkeypatch):
-    server = FastMCP(
-        "demo-http",
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-    )
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    if _MCP_2:
+        # 2.x moved ``transport_security`` from the constructor to
+        # ``streamable_http_app()``.
+        server = FastMCP("demo-http")
 
-    @server.tool()
-    def hello(name: str) -> str:
-        return f"http-hello:{name}"
+        @server.tool()
+        def hello(name: str) -> str:
+            return f"http-hello:{name}"
 
-    @server.resource("demo://readme")
-    def readme() -> str:
-        return "http fixture resource contents"
+        @server.resource("demo://readme")
+        def readme() -> str:
+            return "http fixture resource contents"
 
-    app = server.streamable_http_app()
+        app = server.streamable_http_app(transport_security=security)
+    else:
+        server = FastMCP("demo-http", transport_security=security)
+
+        @server.tool()
+        def hello(name: str) -> str:
+            return f"http-hello:{name}"
+
+        @server.resource("demo://readme")
+        def readme() -> str:
+            return "http fixture resource contents"
+
+        app = server.streamable_http_app()
     transport = httpx.ASGITransport(app=app)
     original_async_client = client_module.httpx.AsyncClient
     seen_headers: list[dict[str, str] | None] = []

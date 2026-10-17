@@ -594,6 +594,51 @@ class VisionModelConfig(BaseModel):
         return bool(self.model and self.api_key)
 
 
+class MiniCPMVLMConfig(BaseModel):
+    """Local MiniCPM-V 4.5 vision-language model (8B, 4-bit quantized).
+
+    MiniCPM-V 4.5 is an 8B-parameter multimodal model whose 4-bit
+    quantization fits in 6-8 GB of VRAM — small enough for a single
+    consumer GPU, a Kaggle T4, or a laptop — served through any
+    OpenAI-compatible server (vLLM, llama.cpp's llama-server, Ollama).
+    The ``minicpm_vlm`` tool uses this endpoint for frame/image
+    understanding without touching the primary chat model's quota.
+
+    Defaults point at a local vLLM instance; override via settings or
+    the ``OPENHARNESS_MINICPM_*`` environment variables.
+    """
+
+    base_url: str = "http://127.0.0.1:8001/v1"
+    model: str = "openbmb/MiniCPM-V-4_5"
+    api_key: str = "EMPTY"  # local servers accept any non-empty key
+    timeout_seconds: float = 180.0
+    # Informational: the quantization the endpoint is expected to serve.
+    quantization: str = "4-bit"
+    # Approximate VRAM footprint for capacity planning / docs.
+    vram_gb: str = "6-8"
+
+    @classmethod
+    def from_env(cls) -> "MiniCPMVLMConfig":
+        """Load MiniCPM-V config from environment variables, keeping the
+        class defaults for anything unset."""
+        return cls(
+            base_url=os.environ.get("OPENHARNESS_MINICPM_BASE_URL", "").strip()
+            or cls.model_fields["base_url"].default,
+            model=os.environ.get("OPENHARNESS_MINICPM_MODEL", "").strip()
+            or cls.model_fields["model"].default,
+            api_key=os.environ.get("OPENHARNESS_MINICPM_API_KEY", "").strip() or "EMPTY",
+            timeout_seconds=float(
+                os.environ.get("OPENHARNESS_MINICPM_TIMEOUT", "0").strip() or 0
+            )
+            or cls.model_fields["timeout_seconds"].default,
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        """Always True — the defaults target a local endpoint."""
+        return bool(self.base_url and self.model)
+
+
 class InferenceSettings(BaseModel):
     """Category 1: LLM inference speed features (items #1-#6, #18).
 
@@ -830,6 +875,9 @@ class Settings(BaseModel):
 
     # Vision model (image-to-text fallback)
     vision: VisionModelConfig = Field(default_factory=VisionModelConfig)
+
+    # Local MiniCPM-V 4.5 VLM (minicpm_vlm tool)
+    minicpm_v: MiniCPMVLMConfig = Field(default_factory=MiniCPMVLMConfig)
 
     # Image generation model
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)

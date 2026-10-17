@@ -40,17 +40,24 @@ STAGES = (
 TERMINAL = {"approved", "failed", "aborted"}
 
 _VALID_TRANSITIONS: dict[str, set[str]] = {
-    "pending": {"generating", "queued", "aborted"},
+    "pending": {"generating", "queued", "failed", "aborted"},
     "generating": {"generated", "failed", "aborted"},
-    "generated": {"queued", "rendering", "qa", "aborted"},
-    "queued": {"rendering", "rendered", "aborted"},      # cache-hit skips render
+    "generated": {"queued", "rendering", "qa", "failed", "aborted"},
+    "queued": {"rendering", "rendered", "failed", "aborted"},   # cache-hit skips render
     "rendering": {"rendered", "failed", "aborted"},
-    "rendered": {"qa", "queued", "aborted"},             # re-render allowed
+    "rendered": {"qa", "queued", "failed", "aborted"},          # re-render allowed
     "qa": {"approved", "failed", "generated", "aborted"},
     "approved": {"queued", "rendering"},                  # re-render after approval
     "failed": {"queued", "rendering", "generating"},      # retry after failure
     "aborted": set(),
 }
+
+#: Stages where actual WORK happens — the only stages whose observed
+#: durations feed the ETA model. The others (``generated``, ``rendered``,
+#: ``approved``) are millisecond waypoint states between work stages
+#: (and ``approved`` is terminal, so its clock never closes) — summing
+#: them produced an ETA of ~zero or None for every real pipeline.
+WORK_STAGES = ("generating", "rendering", "qa")
 
 
 class SceneProgress:
@@ -171,26 +178,53 @@ class ProgressTracker:
         }
 
     def eta_seconds(self) -> float | None:
-        """ETA from the average remaining pipeline time per in-flight scene.
+        """ETA from the average remaining WORK time per in-flight scene.
 
-        Honest model: (avg generate + render + qa durations) scaled by
-        the share of scenes still in flight. Returns None until at
-        least one full pipeline pass has been observed.
+        Honest model: for every scene still in flight, sum the observed
+        average durations of the work stages it still owes (a scene in
+        ``rendering`` owes the rest of rendering + QA; a ``pending``
+        scene owes generating + rendering + QA), then divide by the
+        number of scenes actively being worked right now (observed
+        pipeline parallelism). Returns None until at least one work
+        stage duration has been observed.
         """
         total = len(self._scenes)
         if total == 0:
             return None
-        remaining = sum(1 for r in self._scenes.values() if r.stage not in TERMINAL)
-        if remaining == 0:
+        in_flight = [r for r in self._scenes.values() if r.stage not in TERMINAL]
+        if not in_flight:
             return 0.0
-        observed = 0.0
-        for stage in ("generated", "rendered", "approved"):
+
+        def _avg(stage: str) -> float:
             durations = self._stage_durations.get(stage)
-            if durations:
-                observed += sum(durations) / len(durations)
-        if observed <= 0:
-            return None
-        return round(observed * remaining / max(1, min(4, total)), 1)
+            if not durations:
+                return 0.0
+            return sum(durations) / len(durations)
+
+        if not any(_avg(stage) > 0 for stage in WORK_STAGES):
+            return None  # no work-stage observation yet — refuse to guess
+
+        order = {stage: index for index, stage in enumerate(STAGES)}
+        remaining_work = 0.0
+        for record in in_flight:
+            # Stages at-or-after the scene's current position in the
+            # machine: what this scene still owes. (``queued`` scenes sit
+            # past ``generating`` in the ordering, so they correctly owe
+            # only rendering + QA.)
+            owed = [
+                _avg(stage)
+                for stage in WORK_STAGES
+                if order[stage] >= order[record.stage]
+            ]
+            remaining_work += sum(owed)
+
+        # Observed parallelism = scenes in a work stage RIGHT NOW. When
+        # nothing is actively working (between waves, all queued), fall
+        # back to a conservative estimate of up to 4 concurrent scenes.
+        active_now = sum(1 for r in self._scenes.values() if r.stage in WORK_STAGES)
+        parallelism = float(active_now) if active_now > 0 else float(min(len(in_flight), 4))
+        parallelism = max(1.0, parallelism)
+        return round(remaining_work / parallelism, 1)
 
     def reset(self) -> None:
         self._scenes.clear()

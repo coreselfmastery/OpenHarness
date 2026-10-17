@@ -963,9 +963,23 @@ class ParallelPromptsTool(BaseTool):
             f"succeeded in {elapsed:.1f}s (concurrency {executor.concurrency}, "
             f"{executor.stats.items_run} calls incl. retries)."
         ]
-        for index, result in enumerate(results):
-            label = labels[index] if index < len(labels) else f"#{index + 1}"
-            if isinstance(result, ItemFailure):
+        # The completions themselves MUST be in the output — the agent
+        # never sees ``metadata`` (only programmatic callers do), so a
+        # report that only lists failures makes every successful answer
+        # invisible and the tool useless for its actual purpose.
+        if succeeded:
+            lines.append("")
+            lines.append("----- results (same order as prompts) -----")
+            for index, result in enumerate(results):
+                label = labels[index] if index < len(labels) else f"#{index + 1}"
+                if isinstance(result, ItemFailure):
+                    lines.append(f"### {label} — FAILED: {result.error}")
+                else:
+                    lines.append(f"### {label}")
+                    lines.append(str(result))
+        elif failed:
+            for index, result in enumerate(results):
+                label = labels[index] if index < len(labels) else f"#{index + 1}"
                 lines.append(f"  FAIL  {label}: {result.error}")
         report = executor.report()
         report["elapsed_seconds"] = round(elapsed, 2)

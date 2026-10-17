@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import shutil
 import time
 from collections import deque
@@ -118,6 +119,14 @@ def extract_scene_class(scene_path: Path) -> str:
     return match.group(1) if match else "Scene"
 
 
+# Placeholder keys whose replacement values are MULTI-FLAG argument
+# strings ("-f lavfi -i color=..."). They must be shlex-split into
+# separate argv tokens — there is no shell between us and the engine
+# binary, so injecting them as one token makes ffmpeg fail on every
+# single render.
+_MULTI_FLAG_PLACEHOLDERS = frozenset({"input_args", "codec_args"})
+
+
 def build_render_command(
     *,
     engine: str,
@@ -131,7 +140,13 @@ def build_render_command(
     templates: dict[str, list[str]] | None = None,
     output_dir: Path,
 ) -> list[str]:
-    """Build the explicit argv for one render job (no shell involved)."""
+    """Build the explicit argv for one render job (no shell involved).
+
+    Tokens that are EXACTLY a multi-flag placeholder (``{input_args}``,
+    ``{codec_args}``) expand into multiple argv entries via
+    :func:`shlex.split`; placeholders embedded inside a larger token
+    are substituted in place as before.
+    """
     templates = templates or DEFAULT_ENGINE_TEMPLATES
     template = templates.get(engine) or templates["hyperframes"]
     replacements = {
@@ -149,6 +164,14 @@ def build_render_command(
     }
     argv: list[str] = []
     for token in template:
+        expanded = False
+        for key in _MULTI_FLAG_PLACEHOLDERS:
+            if token == "{" + key + "}":
+                argv.extend(shlex.split(replacements[key]))
+                expanded = True
+                break
+        if expanded:
+            continue
         for key, value in replacements.items():
             token = token.replace("{" + key + "}", value)
         argv.append(token)
@@ -328,6 +351,13 @@ class WorkStealingQueue:
         self._cond = asyncio.Condition()
         self._closed = False
         self.steals = 0
+        # Waker task for put_nowait(): a synchronous enqueue cannot take
+        # the asyncio lock to call cond.notify(), so it schedules this
+        # task on the running loop instead. Without it, a job submitted
+        # while every worker is idle-waiting in cond.wait() NEVER woke
+        # the workers — dependency-wave renders (and any submit after
+        # the workers went idle) hung as "pending" forever.
+        self._waker: asyncio.Task[None] | None = None
 
     async def put(self, item: Any, *, worker_hint: int | None = None) -> None:
         """Enqueue ``item`` onto the least-loaded worker (or a hinted one)."""
@@ -341,12 +371,37 @@ class WorkStealingQueue:
             self._cond.notify()
 
     def put_nowait(self, item: Any, *, worker_hint: int | None = None) -> None:
-        """Synchronous enqueue used before workers are running."""
+        """Synchronous enqueue (callers on the event loop).
+
+        Appends the item and schedules a wake for idle workers — see
+        ``_schedule_wake``. Items enqueued before any worker waits are
+        simply found by the first ``get`` pass.
+        """
         if worker_hint is not None:
             self._deques[worker_hint % len(self._deques)].append(item)
         else:
             sizes = [len(d) for d in self._deques]
             self._deques[sizes.index(min(sizes))].append(item)
+        self._schedule_wake()
+
+    def _schedule_wake(self) -> None:
+        """Wake idle workers after a synchronous enqueue.
+
+        ``cond.notify()`` may only be called while holding the lock, and
+        ``put_nowait`` is synchronous — so schedule an async waker task
+        on the running loop instead. Safe when called off-loop (no-op):
+        workers' ``get`` has a wait-timeout backstop.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop in this thread; the get() backstop covers it
+        if self._waker is None or self._waker.done():
+            self._waker = loop.create_task(self._wake_waiters())
+
+    async def _wake_waiters(self) -> None:
+        async with self._cond:
+            self._cond.notify_all()
 
     def _next_item(self, worker_id: int) -> Any:
         own = self._deques[worker_id % len(self._deques)]
@@ -360,7 +415,12 @@ class WorkStealingQueue:
         return None
 
     async def get(self, worker_id: int) -> Any:
-        """Block until a job is available for this worker (or queue closes)."""
+        """Block until a job is available for this worker (or queue closes).
+
+        The wait is bounded (0.5s) as a belt-and-braces backstop: a
+        notification missed for any reason costs at most half a second
+        of latency instead of a dead worker.
+        """
         while True:
             async with self._cond:
                 item = self._next_item(worker_id)
@@ -368,10 +428,18 @@ class WorkStealingQueue:
                     return item
                 if self._closed:
                     return None
-                await self._cond.wait()
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
 
     async def close(self) -> None:
         """Wake every waiting worker; ``get`` then drains and returns None."""
+        if self._waker is not None and not self._waker.done():
+            try:
+                await self._waker
+            except Exception:  # noqa: BLE001 - closing must always proceed
+                pass
         async with self._cond:
             self._closed = True
             self._cond.notify_all()
@@ -470,6 +538,13 @@ class RenderPipeline:
         self._job_seq = 0
         self._started = False
         self._closing = False
+        # Scenes promised by an in-flight dependency-wave chain but not
+        # yet submitted (submit_batch defers later waves behind earlier
+        # ones). ``wait_all`` must wait for these too — otherwise it can
+        # return in the gap between "wave N finished" and "wave N+1
+        # submitted" (both the chain and wait_all poll on ~0.2s cadences,
+        # so the race window is real and hit often).
+        self._pending_submissions = 0
         # worker_id -> live info for monitoring (#40)
         self._worker_state: dict[int, dict[str, Any]] = {
             i: {"busy": False, "current_job": None, "completed": 0} for i in range(self.workers)
@@ -586,6 +661,9 @@ class RenderPipeline:
         first_jobs = submit_wave()
         # Chain later waves onto the completion of earlier ones: each
         # next wave is submitted only when the previous one is finished.
+        later_count = sum(len(wave) for wave in pending_waves)
+        self._pending_submissions += later_count
+
         async def _chain() -> None:
             try:
                 while pending_waves:
@@ -614,9 +692,15 @@ class RenderPipeline:
                             graph.nodes[name].path, engine=engine, tier=tier, output_dir=output_dir
                         )
                         jobs_by_scene[name] = job
+                        self._pending_submissions = max(0, self._pending_submissions - 1)
             except Exception:
                 # The chain task is fire-and-forget; an unhandled error
-                # would silently strand every later wave.
+                # would silently strand every later wave. Release the
+                # un-submitted remainder so wait_all is not stuck on a
+                # promise that will never be kept.
+                remaining_waves = sum(len(wave) for wave in pending_waves)
+                pending_waves.clear()
+                self._pending_submissions = max(0, self._pending_submissions - remaining_waves)
                 log.exception("render dependency-wave chaining failed")
 
         if pending_waves:
@@ -633,9 +717,16 @@ class RenderPipeline:
         return job
 
     async def wait_all(self, *, timeout: float | None = None) -> list[RenderJob]:
-        """Wait for every known job to finish."""
-        deadline = time.monotonic() + (timeout or self.render_timeout_seconds * max(1, len(self._jobs)))
-        while any(j.status in {"pending", "running"} for j in self._jobs.values()):
+        """Wait for every known job to finish — including waves that a
+        dependency chain has promised but not submitted yet."""
+        expected = len(self._jobs) + self._pending_submissions
+        deadline = time.monotonic() + (
+            timeout or self.render_timeout_seconds * max(1, expected)
+        )
+        while (
+            any(j.status in {"pending", "running"} for j in self._jobs.values())
+            or self._pending_submissions > 0
+        ):
             if time.monotonic() > deadline:
                 break
             await asyncio.sleep(0.2)

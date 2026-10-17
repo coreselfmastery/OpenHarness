@@ -277,9 +277,14 @@ class SemanticCache:
         self.hits = 0
         self.misses = 0
 
-    @staticmethod
-    def _request_text(request: ApiMessageRequest) -> str:
-        """Similarity text = the USER messages only.
+    # Cap on how much of each tool result body feeds the similarity
+    # text: enough to distinguish different results, not so much that
+    # one huge result dominates the shingle set.
+    _TOOL_RESULT_SIMILARITY_CAP = 2000
+
+    @classmethod
+    def _request_text(cls, request: ApiMessageRequest) -> str:
+        """Similarity text = the USER messages, tool results included.
 
         The system prompt is deliberately excluded: it is long, largely
         stable across a session (environment, skills, brand anchors,
@@ -288,19 +293,35 @@ class SemanticCache:
         > 0.88 similarity and replayed the WRONG cached response. The
         user turns are what actually distinguishes one request from
         another.
+
+        ``ToolResultBlock`` bodies in user messages are ALSO included:
+        in the agent loop, consecutive requests share the same user
+        text but differ in what the tools returned. Ignoring tool
+        results made Turn 1 and Turn 2 produce identical fingerprints —
+        a guaranteed false cache hit that replayed the answer to the
+        *previous* tool state.
         """
         parts: list[str] = []
         for message in request.messages:
-            if message.role == "user":
-                parts.append(message.text)
+            if message.role != "user":
+                continue
+            parts.append(message.text)
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    body = block.content[: cls._TOOL_RESULT_SIMILARITY_CAP]
+                    parts.append(f"[tool {block.tool_use_id}] {body}")
         return "\n".join(parts)
 
     @staticmethod
-    def _stable_key(text: str) -> str:
-        """Stable cache key (sha256 prefix) — survives process restarts."""
+    def _stable_key(model: str, text: str) -> str:
+        """Stable cache key (sha256 prefix) — survives process restarts.
+
+        The model id is part of the key: switching models must never
+        replay an answer produced by a different model.
+        """
         import hashlib
 
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(f"{model}\x00{text}".encode("utf-8")).hexdigest()[:16]
 
     def lookup(self, request: ApiMessageRequest) -> ApiMessageCompleteEvent | None:
         if self._store is None:
@@ -319,6 +340,11 @@ class SemanticCache:
         best_key: str | None = None
         best_score = 0.0
         for key, entry in self._store.namespace_entries(self.NAMESPACE, self.max_entries).items():
+            # Model scoping: an entry cached for another model is not a
+            # valid answer for this request, no matter how similar the
+            # prompts are.
+            if str(entry.get("model") or "") != request.model:
+                continue
             score = _signature_similarity(signature, entry.get("signature") or [])
             if score > best_score:
                 best_score = score
@@ -353,7 +379,7 @@ class SemanticCache:
         text = self._request_text(request)
         if not text.strip():
             return
-        key = self._stable_key(text)
+        key = self._stable_key(request.model, text)
         payload = {
             "signature": _minhash_signature(text),
             "created_at": time.time(),

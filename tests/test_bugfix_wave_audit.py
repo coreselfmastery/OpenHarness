@@ -740,8 +740,11 @@ def test_audit_semantic_cache_short_prompt_exact_only():
 def test_audit_semantic_cache_stable_key():
     from openharness.services.llm_pipeline import SemanticCache
 
-    assert SemanticCache._stable_key("hello") == SemanticCache._stable_key("hello")
-    assert SemanticCache._stable_key("hello") != SemanticCache._stable_key("hellp")
+    # The key is model-scoped: same model + same text -> same key;
+    # different text OR different model -> different key.
+    assert SemanticCache._stable_key("m1", "hello") == SemanticCache._stable_key("m1", "hello")
+    assert SemanticCache._stable_key("m1", "hello") != SemanticCache._stable_key("m1", "hellp")
+    assert SemanticCache._stable_key("m1", "hello") != SemanticCache._stable_key("m2", "hello")
 
 
 # ======================================================================
