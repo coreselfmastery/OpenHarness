@@ -32,9 +32,15 @@ class TodoWriteTool(BaseTool):
         checked_line = f"- [x] {arguments.item}"
         target_line = checked_line if arguments.checked else unchecked_line
 
-        if unchecked_line in existing and arguments.checked:
+        if arguments.checked and unchecked_line in existing:
             # Mark existing unchecked item as done (in-place update)
             updated = existing.replace(unchecked_line, checked_line, 1)
+        elif not arguments.checked and checked_line in existing:
+            # Un-check an existing checked item (in-place update). The old
+            # code fell through to the append branch here, leaving BOTH
+            # `- [x] item` and `- [ ] item` in the file — the checklist
+            # asserted both states at once.
+            updated = existing.replace(checked_line, unchecked_line, 1)
         elif target_line in existing:
             # Item already in desired state — no-op
             return ToolResult(output=f"No change needed in {path}")

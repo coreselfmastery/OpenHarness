@@ -705,9 +705,22 @@ class RacingClient(SupportsStreamingMessages):
                 break
             name, stream = winner
             self.races_won[name] = self.races_won.get(name, 0) + 1
-            async for event in stream:
-                yield event
-            return
+            try:
+                async for event in stream:
+                    yield event
+                return
+            finally:
+                # Early consumer abort (kill switch / user cancellation):
+                # the WINNING pump task would otherwise keep streaming the
+                # full paid provider response into an abandoned queue.
+                # Cancel and reap it before propagating the abort.
+                pump = getattr(stream, "_pump_task", None)
+                if pump is not None and not pump.done():
+                    pump.cancel()
+                    try:
+                        await pump
+                    except BaseException:  # noqa: BLE001 - cleanup must not mask the abort
+                        pass
         if last_error is not None:
             raise last_error
 
@@ -773,11 +786,20 @@ class RacingClient(SupportsStreamingMessages):
                     for task_index, task in enumerate(tasks):
                         if task_index != index and not task.done():
                             task.cancel()
+                    streams[index]._pump_task = tasks[index]
                     return routes[index][0], streams[index]
                 # Retry chatter from a non-winning route — keep waiting.
             if error is not None:
                 return error
             return RuntimeError("all racing routes finished without producing content")
+        except BaseException:
+            # _race_once itself was cancelled (outer abort): every pump
+            # task must be cancelled, not only when an error was seen —
+            # otherwise all racing streams leak into the background.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            raise
         finally:
             if error is not None:
                 for task in tasks:
@@ -1094,6 +1116,24 @@ class InferencePipelineClient(SupportsStreamingMessages):
                 self.stats.semantic_cache_hits += 1
                 if cached.message.text:
                     yield ApiTextDeltaEvent(text=cached.message.text)
+                # Replays are FREE. The engine's session cost tracker
+                # (#28) records ``event.usage`` for EVERY complete event
+                # it receives — replaying the ORIGINAL usage re-billed a
+                # cached answer on every hit and could trip the
+                # cost-budget halt long before the real spend reached it.
+                # Zero the usage on the replayed event (the original call
+                # already recorded its usage when it happened).
+                if (
+                    int(getattr(cached.usage, "input_tokens", 0) or 0)
+                    or int(getattr(cached.usage, "output_tokens", 0) or 0)
+                ):
+                    from openharness.api.usage import UsageSnapshot
+
+                    cached = ApiMessageCompleteEvent(
+                        message=cached.message,
+                        usage=UsageSnapshot(),
+                        stop_reason=cached.stop_reason,
+                    )
                 yield cached
                 return
 

@@ -26,6 +26,18 @@ class McpServerNotConnectedError(Exception):
     """Raised when an MCP server is not connected or its session has been lost."""
 
 
+class McpToolExecutionError(Exception):
+    """The MCP server executed the tool and reported isError=True.
+
+    ``ClientSession.call_tool`` does NOT raise for server-side tool
+    failures — it returns a ``CallToolResult`` with ``isError=True``.
+    Without this exception the server's failure text was handed to the
+    model as a SUCCESSFUL tool result, so the agent kept building on a
+    tool that actually failed (error learning, carry-over and UI error
+    styling all skip non-error results).
+    """
+
+
 class McpClientManager:
     """Manage MCP connections and expose tools/resources."""
 
@@ -153,7 +165,14 @@ class McpClientManager:
             parts.append(str(structured))
         if not parts:
             parts.append("(no output)")
-        return "\n".join(parts).strip()
+        text = "\n".join(parts).strip()
+        # Server-side execution failure (isError=True): surface as an
+        # ERROR, not as a successful result — see McpToolExecutionError.
+        if bool(getattr(result, "isError", False)):
+            raise McpToolExecutionError(
+                f"MCP tool '{tool_name}' on server '{server_name}' failed: {text}"
+            )
+        return text
 
     async def read_resource(self, server_name: str, uri: str) -> str:
         """Read one MCP resource and stringify the response."""

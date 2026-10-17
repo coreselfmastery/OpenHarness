@@ -36,6 +36,7 @@ Retry logic:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -231,7 +232,12 @@ class BatchSceneTool(BaseTool):
         outcomes: list[_SceneOutcome] = []
         retry_jobs: list[_SceneOutcome] = []
         for scene in parse_result.scenes:
-            lint_ok, lint_error = lint_scene_code(scene.code, arguments.file_extension)
+            # ``node --check`` / py_compile are blocking subprocesses —
+            # run them off the event loop (N scenes × seconds each used
+            # to freeze every concurrent agent mid-batch).
+            lint_ok, lint_error = await asyncio.to_thread(
+                lint_scene_code, scene.code, arguments.file_extension
+            )
             if lint_ok:
                 outcomes.append(_SceneOutcome(scene=scene, code=scene.code))
             else:
@@ -268,7 +274,9 @@ class BatchSceneTool(BaseTool):
                     except Exception as exc:  # noqa: BLE001 - retry chain continues
                         last_error = str(exc)
                         continue
-                    lint_ok, lint_error = lint_scene_code(code, arguments.file_extension)
+                    lint_ok, lint_error = await asyncio.to_thread(
+                        lint_scene_code, code, arguments.file_extension
+                    )
                     if lint_ok:
                         return _SceneOutcome(scene=scene, code=code)
                     last_error = lint_error

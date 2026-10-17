@@ -60,8 +60,11 @@ class GrepTool(BaseTool):
             if matches is not None:
                 return _format_rg_result(matches, arguments.timeout_seconds)
 
+            # The Python fallback walks the whole tree synchronously —
+            # off the event loop so a big repo cannot freeze the agent.
             return ToolResult(
-                output=_python_grep_files(
+                output=await asyncio.to_thread(
+                    _python_grep_files,
                     paths=[root],
                     pattern=arguments.pattern,
                     case_sensitive=arguments.case_sensitive,
@@ -82,9 +85,10 @@ class GrepTool(BaseTool):
         if matches is not None:
             return _format_rg_result(matches, arguments.timeout_seconds)
 
-        # Python fallback (kept for portability).
+        # Python fallback (kept for portability) — off the event loop.
         return ToolResult(
-            output=_python_grep_files(
+            output=await asyncio.to_thread(
+                _python_grep_files,
                 paths=root.glob(arguments.file_glob),
                 pattern=arguments.pattern,
                 case_sensitive=arguments.case_sensitive,

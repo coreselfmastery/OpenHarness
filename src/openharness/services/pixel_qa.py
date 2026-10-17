@@ -42,7 +42,14 @@ DEFAULTS = {
     "black_mean": 8.0,          # gray mean below -> black frame
     "white_mean": 247.0,        # gray mean above -> white frame
     "blank_std": 3.0,           # gray std below -> uniform/blank frame
-    "frozen_diff": 1.5,         # mean absdiff below -> frozen pair
+    # Frozen detection uses the MAX per-pixel absdiff between consecutive
+    # sampled frames (at the 320-px analysis scale), NOT the mean: the
+    # mean dilutes localized motion (moving-area/frame-area) AND the
+    # downscale divides displacement, so a 1080p scene with a panel
+    # sliding at 100 px/s scored a mean diff of ~0.6 and was flagged as
+    # CRITICALLY frozen on every pair. "No pixel changed at all" is the
+    # honest frozen signal; any real motion produces large edge diffs.
+    "frozen_max_diff": 8.0,     # max absdiff below -> frozen pair
     "min_in_palette": 0.60,     # fraction of pixels inside palette tolerance
     "palette_tolerance": 60.0,  # BGR euclidean distance to nearest palette color
     "min_text_height": 12,      # px at 1080p, scaled by height/1080
@@ -50,6 +57,7 @@ DEFAULTS = {
     "laplacian_low": 15.0,      # below -> smeared / over-smooth
 }
 _CRITICAL_CHECKS = ("black_frame", "frozen_frame")
+_ALL_CHECKS = frozenset({"black_frame", "frozen_frame", "color_drift", "text_size", "artifacts"})
 
 
 @dataclass
@@ -88,11 +96,22 @@ class ScenePixelReport:
 
     @property
     def passed(self) -> bool:
-        return not any(
-            issue.check in _CRITICAL_CHECKS
-            or self.check_summary.get(issue.check, {}).get("severity") == "fail"
-            for issue in self.issues
-        )
+        """Scene-level verdict — hard failures only.
+
+        Fails when: a critical per-frame issue fired (black/blank/frozen),
+        OR any check summary carries severity "fail" (the "open" entry
+        for an unopenable/corrupt video has no per-frame issue but must
+        NEVER read as a pass), OR nothing was sampled at all (an empty
+        inspection verified nothing). Warn-class findings (text_size /
+        artifacts / color_drift) do NOT fail the scene — the module
+        docstring promises "one input, not the whole verdict".
+        """
+        if self.frames_sampled == 0:
+            return False
+        for entry in self.check_summary.values():
+            if entry.get("severity") == "fail":
+                return False
+        return not any(issue.check in _CRITICAL_CHECKS for issue in self.issues)
 
     @property
     def score(self) -> float:
@@ -240,9 +259,20 @@ class PixelQA:
             report.duration_s = (frame_count / fps) if fps > 0 else 0.0
 
             step = max(1.0, fps / max(0.1, sample_fps)) if fps > 0 else 1.0
-            enabled = enabled_checks or {
+            enabled = set(enabled_checks) if enabled_checks else {
                 "black_frame", "frozen_frame", "color_drift", "text_size", "artifacts"
             }
+            # Unknown check names must FAIL LOUDLY, not silently report
+            # "pass": a typo like "blackframe" created a counter that no
+            # check ever incremented and the summary said severity pass.
+            unknown = enabled - _ALL_CHECKS
+            if unknown:
+                raise ValueError(
+                    "unknown pixel_qa check(s): "
+                    + ", ".join(sorted(unknown))
+                    + " — valid checks: "
+                    + ", ".join(sorted(_ALL_CHECKS))
+                )
 
             previous_gray: Any = None
             previous_index = -1
@@ -285,9 +315,17 @@ class PixelQA:
                         "detail": "no brand palette provided",
                     }
                     continue
+                flagged = counters.get(name, 0)
                 report.check_summary[name] = {
-                    "severity": "fail" if counters.get(name) else "pass",
-                    "frames_flagged": counters.get(name, 0),
+                    # Only CRITICAL checks hard-fail the scene; the others
+                    # are warnings (the old "fail if flagged" escalated a
+                    # single small text-like box into a scene failure,
+                    # contradicting the documented severity model).
+                    "severity": (
+                        "fail" if (flagged and name in _CRITICAL_CHECKS)
+                        else ("warn" if flagged else "pass")
+                    ),
+                    "frames_flagged": flagged,
                     "frames_sampled": sampled,
                 }
             return report
@@ -350,13 +388,14 @@ class PixelQA:
                 resized = cv2.resize(gray, (previous_gray.shape[1], previous_gray.shape[0]))
             else:
                 resized = gray
-            diff = float(cv2.absdiff(resized, previous_gray).mean())
-            if diff < t["frozen_diff"]:
+            diff_matrix = cv2.absdiff(resized, previous_gray)
+            max_diff = float(diff_matrix.max()) if diff_matrix.size else 0.0
+            if max_diff < t["frozen_max_diff"]:
                 report.issues.append(FrameIssue(
                     "frozen_frame", index, timestamp,
-                    f"frozen frame (diff {diff:.2f} from frame {previous_index} "
-                    f"< {t['frozen_diff']})",
-                    min(1.0, (t["frozen_diff"] - diff) / max(0.1, t["frozen_diff"]) + 0.5),
+                    f"frozen frame (max pixel diff {max_diff:.1f} from frame {previous_index} "
+                    f"< {t['frozen_max_diff']} — no pixel changed at all)",
+                    min(1.0, (t["frozen_max_diff"] - max_diff) / max(0.1, t["frozen_max_diff"]) + 0.5),
                 ))
                 counters["frozen_frame"] += 1
 
@@ -492,6 +531,11 @@ def format_report_text(reports: list[ScenePixelReport]) -> str:
                 lines.append(f"    ok    {name}")
             elif severity == "skipped":
                 lines.append(f"    skip  {name} ({summary.get('detail', '')})")
+            elif severity == "warn":
+                lines.append(
+                    f"    WARN  {name}: {summary.get('frames_flagged', 0)} "
+                    f"frame(s) flagged of {summary.get('frames_sampled', 0)}"
+                )
             else:
                 lines.append(
                     f"    FAIL  {name}: {summary.get('frames_flagged', 0)} "

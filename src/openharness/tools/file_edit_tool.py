@@ -68,6 +68,20 @@ class FileEditTool(BaseTool):
         if arguments.replace_all:
             updated = original.replace(arguments.old_str, arguments.new_str)
         else:
+            # A non-unique old_str is AMBIGUOUS: silently editing the
+            # first occurrence edits the WRONG one whenever the model
+            # meant the other — error out and ask for more context (the
+            # same contract as Claude Code's Edit tool).
+            occurrences = original.count(arguments.old_str)
+            if occurrences > 1:
+                return ToolResult(
+                    output=(
+                        f"old_str is not unique: found {occurrences} occurrences. "
+                        "Include more surrounding context lines in old_str to make it "
+                        "unique, or pass replace_all=true to replace every occurrence."
+                    ),
+                    is_error=True,
+                )
             updated = original.replace(arguments.old_str, arguments.new_str, 1)
 
         approval_prompt = context.metadata.get("edit_approval_prompt") if context.metadata else None

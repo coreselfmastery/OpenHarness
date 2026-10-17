@@ -11,6 +11,7 @@ wrong speed. Deterministic, offline, reproducible; complements
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -142,13 +143,25 @@ class FrameDiffTool(BaseTool):
                 arguments.expected_min_flow_px_s,
                 float(arguments.expected_max_flow_px_s or 0.0),
             )
+            if expected[0] > expected[1]:
+                return ToolResult(
+                    output=(
+                        f"frame_diff: expected_min_flow_px_s ({expected[0]}) is "
+                        f"greater than expected_max_flow_px_s ({expected[1]}) — "
+                        "the expected-motion window is empty."
+                    ),
+                    is_error=True,
+                )
 
         analyzer = FrameDiffAnalyzer()
         reports: list[SceneMotionReport] = []
         for video in videos:
             try:
+                # SSIM + Farneback optical flow over hundreds of frames is
+                # pure CPU — run it off the event loop.
                 reports.append(
-                    analyzer.analyze_video(
+                    await asyncio.to_thread(
+                        analyzer.analyze_video,
                         video,
                         sample_fps=arguments.sample_fps,
                         max_frames=arguments.max_frames,

@@ -152,6 +152,22 @@ def extract_tokens(source: str) -> StyleTokens:
     return tokens
 
 
+def _normalize_easing_token(easing: str) -> str:
+    """Normalize one easing token to the canonical comparison form.
+
+    ``cubic-bezier(0.4, 0, 0.2, 1)`` and ``cubic-bezier(0.4,0,0.2,1)``
+    must compare equal (scene-side tokens are normalized this way);
+    named easings (``ease-in-out``, ``linear``, …) are returned as-is.
+    """
+    value = easing.strip()
+    if "cubic-bezier(" in value:
+        inner = value.split("cubic-bezier(", 1)[1].rsplit(")", 1)[0]
+        return "cubic-bezier(" + ",".join(
+            part.strip() for part in inner.split(",") if part.strip()
+        ) + ")"
+    return value
+
+
 def load_reference(
     palette_file: Path | None = None,
     *,
@@ -185,18 +201,18 @@ def load_reference(
             match.group(1).upper() for match in _HEX_RE.finditer(text)
         )
         reference["easings"].extend(
-            match.group(0).replace(" ", "")
-            .replace("cubic-bezier(", "cubic-bezier(")
-            for match in _EASING_RE.finditer(text)
+            match.group(0) for match in _EASING_RE.finditer(text)
         )
-        # Normalize easings extracted from markdown.
-        reference["easings"] = [
-            "cubic-bezier("
-            + ",".join(part.strip() for part in easing.split("cubic-bezier(")[-1]
-                       .rstrip(")").split(","))
-            + ")"
-            for easing in reference["easings"]
-        ]
+    # Normalize EVERY easing (inline AND style-md sourced) to the
+    # space-free ``cubic-bezier(a,b,c,d)`` form — scene tokens are
+    # normalized the same way at extraction time. The old code only
+    # normalized the style_md subset, so the SAME easing written as
+    # ``cubic-bezier(0.4, 0, 0.2, 1)`` in scene code and inline
+    # reference produced a hard ``easing_deviation``. Non-cubic-bezier
+    # easing names (ease-in-out, linear, …) pass through untouched.
+    reference["easings"] = [
+        _normalize_easing_token(easing) for easing in reference["easings"]
+    ]
     # Deduplicate, preserving order.
     reference["palette"] = list(dict.fromkeys(reference["palette"]))
     reference["fonts"] = list(dict.fromkeys(reference["fonts"]))
@@ -214,16 +230,34 @@ class StyleConsistencyChecker:
     def check_files(self, files: list[Path]) -> ConsistencyReport:
         report = ConsistencyReport(reference=self.reference)
         scene_tokens: dict[str, StyleTokens] = {}
+
+        def _display_name(file: Path) -> str:
+            """Readable AND unique per-scene key.
+
+            The stem alone collides when two scene files share a name
+            (``scene.py`` in two dirs) — the second silently overwrote
+            the first's tokens and the cross-scene drift check saw a
+            single scene. On collision the parent directory
+            disambiguates (``chapter1/scene``, ``chapter2/scene``).
+            """
+            name = file.stem
+            if name in scene_tokens:
+                name = f"{file.parent.name}/{file.stem}"
+            while name in scene_tokens:
+                name = f"~{name}"
+            return name
+
         for file in files:
             try:
                 source = file.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             tokens = extract_tokens(source)
-            scene_tokens[file.stem] = tokens
-            report.per_scene_tokens[file.stem] = tokens.as_dict()
+            name = _display_name(file)
+            scene_tokens[name] = tokens
+            report.per_scene_tokens[name] = tokens.as_dict()
             report.scenes_checked += 1
-            self._check_against_reference(file.stem, tokens, report)
+            self._check_against_reference(name, tokens, report)
 
         self._check_cross_scene_drift(scene_tokens, report)
         return report

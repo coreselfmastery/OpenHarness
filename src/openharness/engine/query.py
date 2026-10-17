@@ -30,6 +30,7 @@ from openharness.engine.messages import (
 )
 from openharness.engine.stream_events import (
     AssistantTextDelta,
+    AssistantTextReset,
     AssistantTurnComplete,
     CompactProgressEvent,
     ErrorEvent,
@@ -583,7 +584,7 @@ async def _preprocess_images_in_messages(
     if is_model_multimodal(context.model):
         return
 
-    vision_config = context.tool_metadata.get("vision_model_config")
+    vision_config = (context.tool_metadata or {}).get("vision_model_config")
     if not vision_config:
         # No vision model configured — skip preprocessing.
         return
@@ -695,17 +696,29 @@ async def run_query(
                 auto_compact_threshold_ratio=context.auto_compact_threshold_ratio,
             )
         )
-        while True:
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(progress_queue.get(), timeout=0.05)
+                    yield event, None
+                except asyncio.TimeoutError:
+                    if task.done():
+                        break
+                    continue
+            while not progress_queue.empty():
+                yield progress_queue.get_nowait(), None
+            last_compaction_result = await task
+        except BaseException:
+            # Consumer closed/cancelled the query mid-compaction: the
+            # background summarization task would otherwise keep running
+            # (a paid LLM call whose result is discarded) and mutate
+            # shared message objects in the background. Cancel and reap.
+            task.cancel()
             try:
-                event = await asyncio.wait_for(progress_queue.get(), timeout=0.05)
-                yield event, None
-            except asyncio.TimeoutError:
-                if task.done():
-                    break
-                continue
-        while not progress_queue.empty():
-            yield progress_queue.get_nowait(), None
-        last_compaction_result = await task
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
         return
 
     turn_count = 0
@@ -775,7 +788,12 @@ async def run_query(
             async for event in context.api_client.stream_message(
                 ApiMessageRequest(
                     model=context.model,
-                    messages=messages,
+                    # Snapshot copy: the loop keeps mutating ``messages``
+                    # after the response arrives (coordinator-context
+                    # dance, tool-result appends). Handing the live list
+                    # to the request let those mutations leak into the
+                    # captured request object.
+                    messages=list(messages),
                     system_prompt=context.system_prompt,
                     max_tokens=effective_max_tokens,
                     tools=context.tool_registry.to_api_schema(),
@@ -787,6 +805,11 @@ async def run_query(
                     yield AssistantTextDelta(text=event.text), None
                     continue
                 if isinstance(event, ApiRetryEvent):
+                    # The retry restarts the provider stream from scratch;
+                    # tell the UI to discard the partial assistant text it
+                    # already received (appending the retried stream would
+                    # duplicate the partial first attempt in the buffer).
+                    yield AssistantTextReset(reason=event.message), None
                     yield StatusEvent(
                         message=(
                             f"Request failed; retrying in {event.delay_seconds:.1f}s "
@@ -833,7 +856,13 @@ async def run_query(
             raise RuntimeError("Model stream finished without a final message")
 
         coordinator_context_message: ConversationMessage | None = None
-        if context.system_prompt.startswith("You are a **coordinator**."):
+        # NOTE: substring, not startswith — the real coordinator system
+        # prompt (``get_coordinator_system_prompt``) begins with "You are
+        # Claude Code, an AI assistant that orchestrates …" and only
+        # contains "You are a **coordinator**." a few lines in. The old
+        # ``startswith`` check never matched, so the context message was
+        # never moved out of the way and accumulated in history.
+        if "You are a **coordinator**." in context.system_prompt:
             if messages and messages[-1].role == "user" and messages[-1].text.startswith("# Coordinator User Context"):
                 coordinator_context_message = messages.pop()
 
@@ -865,9 +894,6 @@ async def run_query(
             _auto_checkpoint(context, messages, turn_count)
         # ----------------------------------------------------------------
         yield AssistantTurnComplete(message=final_message, usage=usage), usage
-
-        if coordinator_context_message is not None:
-            messages.append(coordinator_context_message)
 
         if not final_message.tool_uses:
             if context.hook_executor is not None:
@@ -951,6 +977,15 @@ async def run_query(
                 ), None
 
         messages.append(ConversationMessage(role="user", content=tool_results))
+        # Re-append the coordinator context AFTER the tool results (the
+        # old position — right after AssistantTurnComplete — inserted a
+        # user message BETWEEN the assistant tool_use and its tool
+        # results, which broke the tool pairing and made the sanitizer
+        # delete the whole turn). Here it stays the LAST message, so the
+        # next API call sees fresh coordinator context, and the next
+        # iteration pops it again before appending the response.
+        if coordinator_context_message is not None:
+            messages.append(coordinator_context_message)
 
     if context.max_turns is not None:
         raise MaxTurnsExceeded(context.max_turns)
@@ -1295,7 +1330,12 @@ def _resolve_permission_file_path(
     raw_input: dict[str, object],
     parsed_input: object,
 ) -> str | None:
-    for key in ("file_path", "path", "root"):
+    # ``report_path`` is included: several read-only-classified QA tools
+    # (pixel_qa, frame_diff, scene_lint, style_consistency, vlm_qa)
+    # WRITE a JSON report to a caller-chosen path. Without this key the
+    # permission system never saw that write target, so sensitive-path
+    # and deny rules did not apply to it at all.
+    for key in ("file_path", "path", "root", "report_path"):
         value = raw_input.get(key)
         if isinstance(value, str) and value.strip():
             path = Path(value).expanduser()
@@ -1303,7 +1343,7 @@ def _resolve_permission_file_path(
                 path = cwd / path
             return str(path.resolve())
 
-    for attr in ("file_path", "path", "root"):
+    for attr in ("file_path", "path", "root", "report_path"):
         value = getattr(parsed_input, attr, None)
         if isinstance(value, str) and value.strip():
             path = Path(value).expanduser()

@@ -113,9 +113,10 @@ class PermissionChecker:
         if tool_name in self._settings.denied_tools:
             return PermissionDecision(allowed=False, reason=f"{tool_name} is explicitly denied")
 
-        if tool_name in self._settings.allowed_tools:
-            return PermissionDecision(allowed=True, reason=f"{tool_name} is explicitly allowed")
-
+        # User path DENY rules run BEFORE the allowed_tools early-return:
+        # a tool being allow-listed must not silently bypass a deny rule
+        # like {"pattern": "*/secrets/*", "allow": false} — deny-wins is
+        # the safe precedence (and matches how denied_tools is ordered).
         if file_path and self._path_rules:
             for candidate_path in _policy_match_paths(file_path):
                 for rule in self._path_rules:
@@ -125,6 +126,9 @@ class PermissionChecker:
                                 allowed=False,
                                 reason=f"Path {file_path} matches deny rule: {rule.pattern}",
                             )
+
+        if tool_name in self._settings.allowed_tools:
+            return PermissionDecision(allowed=True, reason=f"{tool_name} is explicitly allowed")
 
         if command:
             for pattern in getattr(self._settings, "denied_commands", []):

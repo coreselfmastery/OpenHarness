@@ -43,6 +43,20 @@ def _session_id_from(context: ToolExecutionContext) -> str:
     return str((context.metadata or {}).get("session_id") or "default")
 
 
+def _is_safe_checkpoint_id(checkpoint_id: str) -> bool:
+    """Guard against path traversal in checkpoint ids.
+
+    ``CheckpointManager.restore`` builds ``root / f"{id}.json"``; an
+    id like ``../../credentials`` (unvalidated LLM input, and the
+    checkpoint input schema has no path field so permission path rules
+    never see it) read arbitrary JSON files into the conversation.
+    Real ids are ``cp-YYYYmmdd-HHMMSS-mmm`` — letters/digits/dash/underscore only.
+    """
+    import re
+
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", checkpoint_id or ""))
+
+
 # ======================================================================
 # #11-#16, #21, #24, #25 — render_scenes
 # ======================================================================
@@ -138,7 +152,12 @@ class RenderScenesTool(BaseTool):
             return ToolResult(output="\n".join(lines), metadata={"job_ids": [j.job_id for j in jobs]})
 
         await pipeline.wait_all()
-        jobs_sorted = sorted(pipeline.jobs_snapshot(), key=lambda j: j.job_id)
+        # Summarize ONLY this call's jobs (``submit_batch`` already
+        # returned the full job set, dependency waves included) — the
+        # process-wide ``jobs_snapshot()`` contains every job ever
+        # submitted, so a wait-mode report after an earlier background
+        # batch would count foreign jobs and re-mark foreign scenes.
+        jobs_sorted = sorted(jobs or [], key=lambda j: j.job_id)
         lines = [f"[render_scenes] {len(scene_paths)} scene(s), tier={arguments.tier}, engine={arguments.engine}"]
         passed = failed = cached = 0
         for job in jobs_sorted:
@@ -191,13 +210,18 @@ class RenderQueueStatusTool(BaseTool):
         return True
 
     async def execute(self, arguments: RenderQueueStatusInput, context: ToolExecutionContext) -> ToolResult:
-        from openharness.services.render_pipeline import _PIPELINE, get_render_pipeline
+        from openharness.services.render_pipeline import get_render_pipeline
 
-        if _PIPELINE is None:
-            get_render_pipeline(context.cwd, _settings_from(context))
-        if _PIPELINE is None:  # pragma: no cover - defensive
+        # NOTE: the OLD code did ``from ... import _PIPELINE`` and then
+        # re-checked the local binding — but importing copies the value
+        # (None) at function entry, while ``get_render_pipeline()``
+        # rebinds the MODULE global. The first call on a cold pipeline
+        # always fell into "not started yet" right after creating the
+        # singleton. Use the accessor's return value instead.
+        pipeline = get_render_pipeline(context.cwd, _settings_from(context))
+        if pipeline is None:  # pragma: no cover - defensive
             return ToolResult(output="Render pipeline not started yet; render something first.")
-        status = _PIPELINE.status()
+        status = pipeline.status()
         lines = ["[render_queue_status]"]
         for worker_id, state in status["workers"].items():
             current = f" job={state['current_job']}" if state["current_job"] else ""
@@ -209,7 +233,7 @@ class RenderQueueStatusTool(BaseTool):
         lines.append(f"  jobs: {json.dumps(status['jobs'])}")
         if status["avg_render_seconds"] is not None:
             lines.append(f"  avg render: {status['avg_render_seconds']}s  codec: {status['codec']}")
-        recent = _PIPELINE.recent_jobs(arguments.recent)
+        recent = pipeline.recent_jobs(arguments.recent)
         for job in recent:
             lines.append(f"  [{job['job_id']}] {job['scene']} {job['tier']} -> {job['status']} ({job['duration_seconds']}s)")
         return ToolResult(output="\n".join(lines), metadata=status)
@@ -246,12 +270,18 @@ class QAReviewTool(BaseTool):
     input_model = QAReviewInput
 
     def is_read_only(self, arguments: QAReviewInput) -> bool:
-        return True
+        # qa_review mutates global state: tracker marks, pipeline
+        # record_quality, and with promote=True it enqueues REAL final
+        # renders. The read-only fast-path in the permission checker
+        # auto-allows read-only tools in EVERY mode (including plan
+        # mode) — so a promoting review must go through the normal
+        # mutating-tool gate.
+        return not arguments.promote
 
     async def execute(self, arguments: QAReviewInput, context: ToolExecutionContext) -> ToolResult:
         from openharness.services.progress_tracker import get_progress_tracker
         from openharness.services.qa_pipeline import build_qa_reviewer_from_metadata
-        from openharness.services.render_pipeline import _PIPELINE
+        from openharness.services.render_pipeline import get_render_pipeline
 
         scene_paths = []
         for entry in arguments.scenes:
@@ -321,18 +351,23 @@ class QAReviewTool(BaseTool):
                     f"{issue.get('detail')} -> {issue.get('fix')}"
                 )
             # Record the score with the render pipeline for early exit (#13).
-            if _PIPELINE is not None:
+            # Use the accessor (never a from-import binding): on a cold
+            # process the module global is None until someone creates the
+            # singleton, which silently skipped quality recording and
+            # promotion for every qa_review that ran first.
+            pipeline = get_render_pipeline(context.cwd, _settings_from(context))
+            if pipeline is not None:
                 scene_path = next((p for p in scene_paths if p.name == verdict.scene or p.stem == verdict.scene), None)
                 if scene_path is not None:
-                    _PIPELINE.record_quality(scene_path, verdict.score, tier=arguments.tier)
+                    pipeline.record_quality(scene_path, verdict.score, tier=arguments.tier)
                     if verdict.passed:
                         tracker.mark(scene_path.stem, "approved", detail=verdict.summary[:100])
                     else:
                         tracker.mark(scene_path.stem, "generated", detail=f"QA fail: {verdict.summary[:100]}")
-            if arguments.promote and verdict.passed and _PIPELINE is not None:
+            if arguments.promote and verdict.passed and pipeline is not None:
                 scene_path = next((p for p in scene_paths if p.name == verdict.scene or p.stem == verdict.scene), None)
                 if scene_path is not None:
-                    job = _PIPELINE.promote(
+                    job = pipeline.promote(
                         scene_path,
                         engine=arguments.engine,
                         early_exit_threshold=threshold,
@@ -499,6 +534,14 @@ class CheckpointTool(BaseTool):
                 return ToolResult(output="No live conversation to roll back.", is_error=True)
             if not arguments.checkpoint_id:
                 return ToolResult(output="restore requires checkpoint_id.", is_error=True)
+            if not _is_safe_checkpoint_id(arguments.checkpoint_id):
+                return ToolResult(
+                    output=(
+                        f"Invalid checkpoint id: {arguments.checkpoint_id!r}. "
+                        "Ids look like cp-YYYYmmdd-HHMMSS-mmm (letters, digits, dashes only)."
+                    ),
+                    is_error=True,
+                )
             payload = manager.restore(arguments.checkpoint_id)
             if payload is None:
                 return ToolResult(
@@ -510,6 +553,17 @@ class CheckpointTool(BaseTool):
                     restored.append(ConversationMessage.model_validate(raw))
                 except Exception:
                     continue
+            if not restored:
+                # Restoring an empty/unparseable payload must NEVER wipe
+                # the live conversation to zero messages while reporting
+                # success — that destroyed the whole session.
+                return ToolResult(
+                    output=(
+                        f"Checkpoint {arguments.checkpoint_id} contains no valid "
+                        "conversation messages; rollback aborted."
+                    ),
+                    is_error=True,
+                )
             before = len(engine.live_messages)
             engine.rollback_messages(restored)
             return ToolResult(
@@ -522,6 +576,8 @@ class CheckpointTool(BaseTool):
         if action == "diff":
             if not (arguments.checkpoint_id and arguments.second_id):
                 return ToolResult(output="diff requires checkpoint_id and second_id.", is_error=True)
+            if not (_is_safe_checkpoint_id(arguments.checkpoint_id) and _is_safe_checkpoint_id(arguments.second_id)):
+                return ToolResult(output="Invalid checkpoint id (expected cp-YYYYmmdd-HHMMSS-mmm form).", is_error=True)
             diff = manager.diff(arguments.checkpoint_id, arguments.second_id)
             if diff is None:
                 return ToolResult(output="One of the checkpoint ids is unknown.", is_error=True)

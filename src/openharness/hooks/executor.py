@@ -13,7 +13,12 @@ from typing import Any
 
 import httpx
 
-from openharness.api.client import ApiMessageCompleteEvent, ApiMessageRequest, SupportsStreamingMessages
+from openharness.api.client import (
+    ApiMessageCompleteEvent,
+    ApiMessageRequest,
+    ApiTextDeltaEvent,
+    SupportsStreamingMessages,
+)
 from openharness.engine.messages import ConversationMessage
 from openharness.hooks.events import HookEvent
 from openharness.hooks.loader import HookRegistry
@@ -190,11 +195,30 @@ class HookExecutor:
 
         text_chunks: list[str] = []
         final_event: ApiMessageCompleteEvent | None = None
-        async for event_item in self._context.api_client.stream_message(request):
-            if isinstance(event_item, ApiMessageCompleteEvent):
-                final_event = event_item
-            else:
-                text_chunks.append(event_item.text)
+        # Enforce the hook's configured timeout (command/http hooks do;
+        # the LLM call previously ran unbounded) and guard the stream:
+        # ApiRetryEvent (429/network blips) has no ``.text`` attribute —
+        # one retry mid-hook raised AttributeError, which crashed the
+        # PRE_TOOL_USE path and (worse) the whole USER_PROMPT_SUBMIT
+        # submit_message call.
+        async def _consume_stream() -> None:
+            nonlocal final_event
+            async for event_item in self._context.api_client.stream_message(request):
+                if isinstance(event_item, ApiMessageCompleteEvent):
+                    final_event = event_item
+                elif isinstance(event_item, ApiTextDeltaEvent):
+                    text_chunks.append(event_item.text)
+                # Every other stream event (retry chatter, etc.) is ignored.
+
+        try:
+            await asyncio.wait_for(_consume_stream(), timeout=hook.timeout_seconds)
+        except asyncio.TimeoutError:
+            return HookResult(
+                hook_type=hook.type,
+                success=False,
+                blocked=hook.block_on_failure,
+                reason=f"hook timed out after {hook.timeout_seconds}s",
+            )
 
         text = "".join(text_chunks)
         if final_event is not None and final_event.message.text:

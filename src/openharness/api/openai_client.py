@@ -432,11 +432,33 @@ class OpenAICompatibleClient:
         if collected_reasoning:
             final_message._reasoning = collected_reasoning  # type: ignore[attr-defined]
 
+        # ``stream_options`` is dropped for tool-call requests (provider
+        # compat — see the Kimi note above), so many OpenAI-compatible
+        # endpoints then never report usage and every tool turn recorded
+        # a hard ZERO cost. Fall back to a clearly-rough estimate of what
+        # was actually sent and produced, so the cost dashboard and
+        # session budget see something closer to reality than 0.
+        final_input = usage_data.get("input_tokens", 0)
+        final_output = usage_data.get("output_tokens", 0)
+        if not final_input and not final_output:
+            from openharness.services.token_estimation import estimate_tokens
+
+            final_input = estimate_tokens(
+                "".join(
+                    str(getattr(message, "text", "") or "")
+                    for message in request.messages
+                )
+            )
+            final_output = estimate_tokens(collected_content + collected_reasoning) + sum(
+                estimate_tokens(str(entry.get("arguments") or ""))
+                for entry in collected_tool_calls.values()
+            )
+
         yield ApiMessageCompleteEvent(
             message=final_message,
             usage=UsageSnapshot(
-                input_tokens=usage_data.get("input_tokens", 0),
-                output_tokens=usage_data.get("output_tokens", 0),
+                input_tokens=final_input,
+                output_tokens=final_output,
             ),
             stop_reason=finish_reason,
         )

@@ -15,6 +15,7 @@ verdict.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -166,8 +167,12 @@ class PixelQATool(BaseTool):
         reports = []
         for video in videos:
             try:
+                # OpenCV inspection (incl. Farneback optical flow over up
+                # to 900 frames) is pure CPU — run it off the event loop
+                # so minutes of analysis cannot freeze the whole agent.
                 reports.append(
-                    qa.inspect_video(
+                    await asyncio.to_thread(
+                        qa.inspect_video,
                         video,
                         palette=palette or None,
                         sample_fps=arguments.sample_fps,
@@ -190,7 +195,11 @@ class PixelQATool(BaseTool):
 
             tracker = get_progress_tracker()
             for report in reports:
-                if not report.frames_sampled:
+                # Mark even when nothing was sampled: an unopenable video
+                # reports passed=False (severity "fail" on the "open"
+                # entry) and the scene must show up as failed, not stay
+                # silently unmarked in the tracker.
+                if not report.frames_sampled and report.passed:
                     continue
                 tracker.mark(report.scene, "qa", detail=f"pixel-qa score {report.score}")
                 if not report.passed:

@@ -34,6 +34,15 @@ class PromptTrackerInput(BaseModel):
         "register/record/best/retire, unused for stats.",
     )
     version: int = Field(default=1, ge=1, le=10_000, description="Template version.")
+    all_versions: bool = Field(
+        default=False,
+        description=(
+            "retire: retire EVERY version of the prompt instead of just "
+            "`version`. Without this the service's retire-all path was "
+            "unreachable — retiring without a version silently retired "
+            "only v1 while v2+ stayed active."
+        ),
+    )
     template: str = Field(
         default="",
         description="Template text for register (kept private to the store).",
@@ -174,7 +183,10 @@ class PromptTrackerTool(BaseTool):
             return ToolResult(
                 output="prompt_tracker: `prompt_id` is required.", is_error=True
             )
-        updated = tracker.retire_prompt(arguments.prompt_id, version=arguments.version)
+        updated = tracker.retire_prompt(
+            arguments.prompt_id,
+            version=None if arguments.all_versions else arguments.version,
+        )
         if not updated:
             return ToolResult(
                 output="[prompt_tracker] no matching version to retire.",

@@ -135,6 +135,34 @@ def mean_flow_magnitude(gray_a: Any, gray_b: Any) -> float:
     return float(magnitude.mean())
 
 
+def percentile_flow_magnitude(gray_a: Any, gray_b: Any, percentile: float = 99.0) -> float:
+    """High-percentile Farneback flow magnitude between two gray frames.
+
+    The MEAN flow dilutes object motion across the whole (mostly static)
+    frame — a 1920-px scene with an object moving 80 px/s measured a mean
+    flow of ~0.2 px and the speed check reported "animation missing".
+    The 99th percentile tracks the fastest-moving hundredth of the frame,
+    which approximates the OBJECT velocity (what the expected-motion
+    window actually describes) for any object covering more than ~1% of
+    the frame, instead of the background-averaged speed. p99 (not p90)
+    because moving objects routinely cover less than a tenth of a frame.
+    """
+    import cv2
+    import numpy as np
+
+    a = np.asarray(gray_a, dtype=np.uint8)
+    b = np.asarray(gray_b, dtype=np.uint8)
+    if a.shape != b.shape or a.size == 0:
+        return 0.0
+    flow = cv2.calcOpticalFlowFarneback(
+        a, b, None, 0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    magnitude = np.linalg.norm(flow, axis=2)
+    if magnitude.size == 0:
+        return 0.0
+    return float(np.percentile(magnitude, percentile))
+
+
 @dataclass
 class MotionIssue:
     """One detected motion problem at one adjacent-frame pair."""
@@ -282,6 +310,7 @@ class FrameDiffAnalyzer:
 
             ssims: list[float] = []
             flows: list[float] = []
+            strong_flows: list[float] = []
             pair_issues: list[MotionIssue] = []
             identical_run = 0
             sample_dt = step / fps  # seconds between analyzed pairs
@@ -291,6 +320,7 @@ class FrameDiffAnalyzer:
                 pair_flow = mean_flow_magnitude(grays[i], grays[i + 1])
                 ssims.append(pair_ssim)
                 flows.append(pair_flow)
+                strong_flows.append(percentile_flow_magnitude(grays[i], grays[i + 1]))
                 frame_index = indices[i + 1]
                 timestamp = frame_index / fps
 
@@ -365,7 +395,22 @@ class FrameDiffAnalyzer:
             # --- intended-motion speed check ---------------------------
             if expected_flow_px_s is not None:
                 low, high = expected_flow_px_s
-                observed = float(np.mean(flows)) / max(sample_dt, 1e-6)
+                # Observed speed uses the p90 (object-region) flow, the
+                # MEDIAN across pairs (robust to one bad pair), and is
+                # converted to SOURCE-scale pixels: the analysis grid is
+                # 480-px wide, so raw flow magnitudes are in ANALYSIS
+                # pixels. The old mean-flow figure was diluted by the
+                # static background (~250x here) AND unrescaled, so a
+                # correct 80 px/s animation was reported as 0.2 px/s
+                # "below expected minimum" on every check.
+                analysis_width = float(self.config["analysis_width"])
+                scale_to_source = (
+                    report.width / analysis_width
+                    if report.width and analysis_width
+                    else 1.0
+                )
+                observed = float(np.median(strong_flows)) / max(sample_dt, 1e-6)
+                observed *= scale_to_source
                 if observed < low:
                     pair_issues.append(
                         MotionIssue(
@@ -373,8 +418,9 @@ class FrameDiffAnalyzer:
                             frame_index=indices[-1],
                             timestamp_s=report.duration_s,
                             message=(
-                                f"observed motion {observed:.1f} px/s below "
-                                f"expected minimum {low:.1f} px/s - intended "
+                                f"observed object-region motion {observed:.1f} px/s "
+                                f"(source scale, p90 flow) below expected minimum "
+                                f"{low:.1f} px/s - intended "
                                 "animation may be missing"
                             ),
                             confidence=min(1.0, 0.5 + (low - observed) / max(low, 1e-6)),
@@ -387,8 +433,9 @@ class FrameDiffAnalyzer:
                             frame_index=indices[-1],
                             timestamp_s=report.duration_s,
                             message=(
-                                f"observed motion {observed:.1f} px/s above "
-                                f"expected maximum {high:.1f} px/s - animation "
+                                f"observed object-region motion {observed:.1f} px/s "
+                                f"(source scale, p90 flow) above expected maximum "
+                                f"{high:.1f} px/s - animation "
                                 "faster than designed"
                             ),
                             confidence=min(1.0, 0.5 + (observed - high) / max(high, 1e-6)),
@@ -453,9 +500,14 @@ def format_report_text(reports: list[SceneMotionReport]) -> str:
         for check, info in sorted(report.check_summary.items()):
             if info.get("severity") == "info":
                 continue
+            # ``.get`` (not ``[]``): "open" entries (unreadable video /
+            # fewer-than-2-frames) carry only severity+detail — the old
+            # indexing of 'count'/'first_frame' raised KeyError out of the
+            # FORMATTER and aborted the whole tool call, losing the good
+            # videos' results and the JSON report.
             lines.append(
-                f"  - {check} [{info['severity']}] x{info['count']} "
-                f"@frame {info['first_frame']}: {info['detail']}"
+                f"  - {check} [{info.get('severity', '?')}] x{info.get('count', 0)} "
+                f"@frame {info.get('first_frame', 0)}: {info.get('detail', '')}"
             )
         if not report.issues:
             lines.append("  - motion checks clean: no freezes, stalls, or cuts.")

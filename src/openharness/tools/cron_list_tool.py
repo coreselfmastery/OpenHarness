@@ -60,7 +60,7 @@ class CronListTool(BaseTool):
                 payload_line = f"\n     payload: {payload.get('kind', 'agent_turn')} -> {payload.get('channel', '?')}:{payload.get('to', '?')}"
             command = job.get("command") or "(agent_turn)"
             lines.append(
-                f"[{enabled}] {job['name']}  {job.get('schedule', '?')}{timezone}\n"
+                f"[{enabled}] {job.get('name', '(unnamed)')}  {job.get('schedule', '?')}{timezone}\n"
                 f"     cmd: {command}"
                 f"{payload_line}"
                 f"{notify_line}\n"

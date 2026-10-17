@@ -112,8 +112,12 @@ async def acquire_permit_for_task(
     await sem.acquire()
     try:
         record = await coro_factory()
-    except Exception:
-        # Spawn failed — release immediately so the next spawn can proceed.
+    except BaseException:
+        # Spawn failed OR was cancelled — release immediately so the
+        # next spawn can proceed. ``except Exception`` alone leaked the
+        # permit on every CancelledError (kill switch / timeout): N
+        # cancelled spawns permanently burned N permits and the pool
+        # deadlocked (the next acquire blocked forever).
         sem.release()
         raise
 

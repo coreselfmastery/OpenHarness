@@ -82,25 +82,38 @@ def reset_session_services() -> None:
 # ----------------------------------------------------------------------
 
 def _agent_semaphore_probe() -> dict[str, Any]:
-    """Blocked = permits currently held; running = permits still free."""
+    """Running = permits currently held (agents actively working).
+
+    A HELD permit is WORK IN PROGRESS, not a blocked resource: the old
+    semantics (blocked=held, running=free) made a healthy 100%-utilized
+    agent pool report ``running=0, blocked=N`` — which, combined with
+    the deadlock detector, killed fully-busy sessions as "deadlocked".
+    """
     from openharness.services.agent_concurrency import get_agent_limit, get_agent_semaphore
 
     limit = get_agent_limit()
     semaphore = get_agent_semaphore()
-    held = getattr(semaphore, "_value", limit)
-    free = int(held)
-    return {"name": "agent_semaphore", "blocked": limit - free, "running": free}
+    held = limit - int(getattr(semaphore, "_value", limit))
+    return {"name": "agent_semaphore", "blocked": 0, "running": held}
 
 
 def _render_queue_probe() -> dict[str, Any]:
-    """Blocked = busy render workers; running = idle workers."""
+    """Running = busy render workers; blocked = queued jobs nobody works.
+
+    A BUSY worker is WORK IN PROGRESS, not a blocked resource (old
+    semantics made full utilization look deadlocked — see
+    ``_agent_semaphore_probe``). A genuinely stuck queue — jobs waiting
+    while EVERY worker is idle — still reports blocked>0/running=0.
+    """
     from openharness.services.render_pipeline import _PIPELINE
 
     if _PIPELINE is None:
         return {"name": "render_queue", "blocked": 0, "running": 1}
     busy = sum(1 for state in _PIPELINE._worker_state.values() if state.get("busy"))
     idle = len(_PIPELINE._worker_state) - busy
-    return {"name": "render_queue", "blocked": busy, "running": idle}
+    queued = _PIPELINE._queue.depth if _PIPELINE._queue is not None else 0
+    stuck_pending = queued if (queued > 0 and busy == 0) else 0
+    return {"name": "render_queue", "blocked": stuck_pending, "running": busy + idle}
 
 
 # ----------------------------------------------------------------------
@@ -174,6 +187,13 @@ def bootstrap_session_services(
                 bus.start_watchdog()
             if bool(getattr(control, "deadlock_detection", True)):
                 bus.start_deadlock_monitor()
+    else:
+        # Control plane disabled for THIS session: clear any bus a
+        # PREVIOUS session installed. Leaving it installed kept the old
+        # monitor tasks looping and let get_control_bus() hand a dead
+        # session's bus to the oh_control tool.
+        set_control_bus(None)
+        services.bus = None
 
     # 3. Cost tracker (#28) — halt trips the kill switch.
     if control_enabled and bool(getattr(control, "cost_alerts", True)):

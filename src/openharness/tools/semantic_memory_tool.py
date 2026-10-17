@@ -16,6 +16,7 @@ a deterministic local hashing fallback that works offline.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -95,7 +96,12 @@ class SemanticMemoryTool(BaseTool):
                     output="semantic_memory: `text` is required for remember.",
                     is_error=True,
                 )
-            memory_id = memory.remember(
+            # ``remember`` performs a synchronous HTTP embedding call (up
+            # to the configured timeout) plus a sqlite write — both block
+            # the event loop, freezing every concurrent agent for the
+            # full duration when the embedding endpoint is slow/dead.
+            memory_id = await asyncio.to_thread(
+                memory.remember,
                 text,
                 project=arguments.project,
                 kind=arguments.kind,
@@ -121,10 +127,18 @@ class SemanticMemoryTool(BaseTool):
                     output="semantic_memory: `text` (the query) is required for recall.",
                     is_error=True,
                 )
-            hits = memory.recall(
+            # ``project or None``: an empty project means ALL projects
+            # (matching the ``list`` action's semantics) — passing ""
+            # verbatim filtered to memories stored under the empty-string
+            # project, silently returning nothing and making the
+            # docstring's cross-project recall unreachable.
+            # ``recall`` embeds the query over HTTP and scans up to 5000
+            # rows — run it off the event loop (see remember).
+            hits = await asyncio.to_thread(
+                memory.recall,
                 query,
                 top_k=arguments.top_k,
-                project=arguments.project,
+                project=arguments.project or None,
                 min_similarity=arguments.min_similarity,
             )
             if not hits:

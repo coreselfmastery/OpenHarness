@@ -23,6 +23,7 @@ from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlo
 from openharness.themes import list_themes
 from openharness.engine.stream_events import (
     AssistantTextDelta,
+    AssistantTextReset,
     AssistantTurnComplete,
     CompactProgressEvent,
     ErrorEvent,
@@ -274,6 +275,12 @@ class ReactBackendHost:
         async def _render_event(event: StreamEvent) -> None:
             if isinstance(event, AssistantTextDelta):
                 await self._emit(BackendEvent(type="assistant_delta", message=event.text))
+                return
+            if isinstance(event, AssistantTextReset):
+                # Mid-stream retry: the frontend must discard the partial
+                # assistant text it has accumulated (the retried stream
+                # restarts from scratch and would otherwise duplicate it).
+                await self._emit(BackendEvent(type="assistant_reset", message=event.reason))
                 return
             if isinstance(event, CompactProgressEvent):
                 await self._emit(

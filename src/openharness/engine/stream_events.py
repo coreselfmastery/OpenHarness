@@ -17,6 +17,19 @@ class AssistantTextDelta:
 
 
 @dataclass(frozen=True)
+class AssistantTextReset:
+    """Discard the in-progress assistant text accumulated so far.
+
+    Emitted when the provider connection failed MID-STREAM and the
+    retry restarts the response from scratch: without this reset every
+    UI that appends deltas showed the partial first attempt followed by
+    the full second attempt (duplicated text in the transcript).
+    """
+
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class AssistantTurnComplete:
     """Completed assistant turn."""
 
@@ -81,6 +94,7 @@ class CompactProgressEvent:
 
 StreamEvent = (
     AssistantTextDelta
+    | AssistantTextReset
     | AssistantTurnComplete
     | ToolExecutionStarted
     | ToolExecutionCompleted

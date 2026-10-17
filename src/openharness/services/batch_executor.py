@@ -211,10 +211,26 @@ class AsyncBatchExecutor:
             if backoff_seconds > 0:
                 await asyncio.sleep(backoff_seconds * round_index)
             indexes = sorted(pending)
+            # Map retry-sublist positions back to the ORIGINAL item
+            # indexes: ``run`` calls ``worker(item, enumerate-position)``
+            # and ``on_result(position, ...)`` with the sublist's own
+            # 0..k-1 positions, which contradicted the documented
+            # contract ("retry workers receive the original item and
+            # index again") and fed any index-using worker/callback
+            # wrong values during retry rounds.
+            position_to_index = {position: index for position, index in enumerate(indexes)}
+
+            def _retry_worker(item: Any, position: int, *, _orig=worker, _map=position_to_index):
+                return _orig(item, _map[position])
+
+            def _retry_on_result(position: int, result: Any, *, _orig=on_result, _map=position_to_index):
+                if _orig is not None:
+                    _orig(_map[position], result)
+
             round_results = await self.run(
                 [items[i] for i in indexes],
-                worker,
-                on_result=on_result,
+                _retry_worker,
+                on_result=_retry_on_result if on_result is not None else None,
                 label=f"{label}:retry{round_index}" if label else f"retry{round_index}",
             )
             for slot, result in zip(indexes, round_results):

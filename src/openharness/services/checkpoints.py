@@ -95,7 +95,16 @@ class CheckpointManager:
 
         Returns the raw payload (caller rebuilds models and swaps them
         into the live conversation), or None when the id is unknown.
+        Ids are restricted to ``[A-Za-z0-9_-]`` (they are generated as
+        ``cp-YYYYmmdd-HHMMSS-mmm``): the id is unsanitized LLM input and
+        is interpolated into a filesystem path, so ``../`` traversal
+        must be rejected here as well, not only at the tool layer.
         """
+        import re
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", checkpoint_id or ""):
+            log.warning("checkpoint id rejected (unsafe characters): %r", checkpoint_id)
+            return None
         path = self._root / f"{checkpoint_id}.json"
         if not path.is_file():
             return None

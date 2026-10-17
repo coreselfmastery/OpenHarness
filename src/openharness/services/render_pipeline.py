@@ -866,6 +866,25 @@ class RenderPipeline:
             state["current_job"] = job.job_id
             try:
                 await self._run_job(job, worker_id)
+            except asyncio.CancelledError:
+                # Worker shutdown: leave the job as-is (the pipeline is
+                # closing) but still reset the worker state.
+                state["busy"] = False
+                state["current_job"] = None
+                raise
+            except BaseException as exc:  # noqa: BLE001 - a worker must survive any job
+                # A crashing job must NEVER kill the worker task: a dead
+                # worker silently shrinks the pool, the job stays
+                # "running" forever and wait()/wait_all() hang for their
+                # full multi-hour deadlines with no surfaced error.
+                job.status = "failed"
+                job.error = f"render worker crashed: {type(exc).__name__}: {exc}"
+                job.finished_at = time.monotonic()
+                try:
+                    self._finish(job)
+                except Exception:  # noqa: BLE001 - never mask the loop
+                    log.exception("failed to finalize crashed job %s", job.job_id)
+                log.exception("render worker %d: job %s crashed", worker_id, job.job_id)
             finally:
                 state["busy"] = False
                 state["current_job"] = None
@@ -990,7 +1009,18 @@ class RenderPipeline:
             self._jobs.pop(job_id, None)
 
     def _engine_args_for(self, job: RenderJob) -> list[str]:
-        return self._templates.get(job.engine, [])[:2] + [job.tier]
+        """Fingerprint inputs that fully determine the rendered output.
+
+        The previous version hashed only the first two template tokens +
+        tier, so changing ``resolution_tiers`` (draft 640x360 ->
+        960x540) or editing the template beyond its first two tokens
+        produced the SAME fingerprint — the cache then served the stale
+        wrong-resolution render as a hit. The resolved width/height/fps
+        and the FULL effective template are included now.
+        """
+        template = self._templates.get(job.engine) or DEFAULT_ENGINE_TEMPLATES["hyperframes"]
+        width, height = parse_resolution(self.resolution_tiers.get(job.tier, "1280x720"))
+        return [*template, job.tier, f"{width}x{height}x30"]
 
     def _finish(self, job: RenderJob) -> None:
         if job.duration_seconds == 0.0 and job.started_at:

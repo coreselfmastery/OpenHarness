@@ -130,9 +130,13 @@ def _cosine(a: list[float], b: list[float]) -> float:
             return 0.0
         return float(np.dot(va, vb) / denom)
     except ImportError:  # pragma: no cover - numpy ships with opencv
-        denom = sum(x * y for x, y in zip(a, b)) ** 0.5 * sum(
-            x * y for x, y in zip(b, b)
-        ) ** 0.5
+        # Correct fallback: ||a|| * ||b||. The old version used
+        # sqrt(dot(a,b)) * sqrt(dot(b,b)) — cosine([1,1],[1,0]) returned
+        # 1.0 instead of 0.707, and negative dots raised the value into
+        # the complex plane, crashing the later sort with TypeError.
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        denom = norm_a * norm_b
         if denom == 0.0:
             return 0.0
         return sum(x * y for x, y in zip(a, b)) / denom

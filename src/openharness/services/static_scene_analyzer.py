@@ -71,6 +71,27 @@ _PY_NON_DETERMINISTIC_NAMES = {
 }
 _PY_NON_DETERMINISTIC_MODULES = {"random", "time", "datetime", "uuid", "secrets"}
 
+# Bare function name -> the non-deterministic module it (typically) comes
+# from; used to decide whether a BARE call like ``choice(...)`` is really
+# the library function (module imported) or a legitimate local helper.
+_BARE_NAME_TO_MODULE: dict[str, str] = {
+    "random": "random",
+    "uniform": "random",
+    "randint": "random",
+    "choice": "random",
+    "shuffle": "random",
+    "sample": "random",
+    "randrange": "random",
+    "time": "time",
+    "monotonic": "time",
+    "now": "datetime",
+    "today": "datetime",
+    "utcnow": "datetime",
+    "uuid4": "uuid",
+    "uuid1": "uuid",
+    "urandom": "os",
+}
+
 _JS_ASSET_RE = re.compile(r"['\"]([^'\"]+\.(?:png|jpe?g|webp|svg|gif|bmp|mp3|wav|ogg|flac|m4a|mp4|mov|webm|ttf|otf|woff2?))['\"]", re.IGNORECASE)
 _JS_FONT_SIZE_RE = re.compile(r"font(?:Size|size)\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)")
 _JS_HEX_COLOR_RE = re.compile(r"['\"]#([0-9a-fA-F]{6})['\"]")
@@ -206,8 +227,27 @@ class StaticSceneAnalyzer:
                 func_name = self._dotted_name(node.func)
                 bare = func_name.rsplit(".", 1)[-1]
                 if bare in _PY_NON_DETERMINISTIC_NAMES:
-                    root = func_name.split(".", 1)[0]
-                    if root in _PY_NON_DETERMINISTIC_MODULES or "." not in func_name:
+                    # Only flag calls whose non-deterministic source module
+                    # is actually imported. The old ``"." not in func_name``
+                    # escape hard-failed legitimate local helpers (a local
+                    # ``def choice(items)`` + ``choice([...])`` was flagged
+                    # and blocked the scene from rendering) while the
+                    # import-derived ``declared`` set sat unused.
+                    if "." in func_name:
+                        root = func_name.split(".", 1)[0]
+                        flagged = (
+                            root in _PY_NON_DETERMINISTIC_MODULES
+                            and root in declared
+                        )
+                    else:
+                        # Bare call: either directly imported from the
+                        # module (``from random import choice``) or the
+                        # module itself is imported.
+                        module = _BARE_NAME_TO_MODULE.get(bare)
+                        flagged = bare in declared or (
+                            module is not None and module in declared
+                        )
+                    if flagged:
                         report.issues.append(
                             LintIssue(
                                 check="non_determinism",

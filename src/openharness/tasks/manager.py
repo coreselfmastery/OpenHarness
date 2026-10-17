@@ -138,7 +138,13 @@ class BackgroundTaskManager:
                 raise ValueError(
                     "Local agent tasks require ANTHROPIC_API_KEY or an explicit command/argv override"
                 )
-            argv = ["python", "-m", "openharness", "--api-key", effective_api_key]
+            # The key goes through the ENVIRONMENT, never the command
+            # line: argv is visible to every local user via `ps` /
+            # /proc/<pid>/cmdline for the whole lifetime of the spawned
+            # agent. The child CLI resolves ANTHROPIC_API_KEY from its
+            # merged environment (settings.py env precedence).
+            env = {**(env or {}), "ANTHROPIC_API_KEY": effective_api_key}
+            argv = ["python", "-m", "openharness"]
             if model:
                 argv.extend(["--model", model])
 
@@ -199,6 +205,16 @@ class BackgroundTaskManager:
                 return task
             raise ValueError(f"Task {task_id} is not running")
 
+        # Mark killed BEFORE terminating: _watch_process also awaits
+        # process.wait() and races this coroutine. If the watcher won
+        # the race it saw status != "killed" yet, marked the task
+        # completed/failed (rc=-15) and notified listeners — then this
+        # method set "killed" and notified AGAIN, double-firing every
+        # completion listener (e.g. SUBAGENT_STOP) with conflicting
+        # statuses. With the status set first, the watcher's own guard
+        # holds and only ONE notification fires (from here).
+        task.status = "killed"
+        task.ended_at = time.time()
         process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=3)
@@ -206,9 +222,6 @@ class BackgroundTaskManager:
             process.kill()
             await process.wait()
         await _close_process_stdin(process)
-
-        task.status = "killed"
-        task.ended_at = time.time()
         await self._notify_completion_listeners(task)
         return task
 
@@ -229,12 +242,18 @@ class BackgroundTaskManager:
                 await process.stdin.drain()
 
     def read_task_output(self, task_id: str, *, max_bytes: int = 12000) -> str:
-        """Return the tail of a task's output file."""
+        """Return the tail of a task's output file.
+
+        The limit is BYTES (matching the advertised ``max_bytes``): the
+        previous character-based slice was 2-4x over budget for
+        multibyte logs, and could split a UTF-8 sequence mid-character
+        (the replacement-character mojibake at the start of a tail).
+        """
         task = self._require_task(task_id)
-        content = task.output_file.read_text(encoding="utf-8", errors="replace")
-        if len(content) > max_bytes:
-            return content[-max_bytes:]
-        return content
+        raw = task.output_file.read_bytes()
+        if len(raw) > max_bytes:
+            raw = raw[-max_bytes:]
+        return raw.decode(encoding="utf-8", errors="replace")
 
     def register_completion_listener(self, listener: CompletionListener) -> Callable[[], None]:
         """Register a callback fired whenever a task reaches a terminal state."""
@@ -263,10 +282,14 @@ class BackgroundTaskManager:
 
         task = self._tasks[task_id]
         task.return_code = return_code
-        if task.status != "killed":
+        # Only the coroutine that actually transitions the task to a
+        # terminal state notifies the listeners. A watcher that wakes up
+        # after stop_task already marked the task "killed" leaves the
+        # notification to stop_task (which owns that completion).
+        if task.status not in {"completed", "failed", "killed"}:
             task.status = "completed" if return_code == 0 else "failed"
-        task.ended_at = time.time()
-        await self._notify_completion_listeners(task)
+            task.ended_at = time.time()
+            await self._notify_completion_listeners(task)
         self._processes.pop(task_id, None)
         self._waiters.pop(task_id, None)
 

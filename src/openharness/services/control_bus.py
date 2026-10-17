@@ -236,10 +236,19 @@ class ControlBus:
         """Return a deadlock report, or None when the system looks alive.
 
         A deadlock is: every registered subsystem reports all of its
-        workers/permits blocked, AND there has been no progress since
-        the previous probe (#34's "detect stuck agents").
+        workers/permits blocked, AND there has been NO OBSERVABLE
+        PROGRESS for at least ``deadlock_probe_seconds`` (the docstring
+        always required this — the previous implementation never
+        checked it, so a healthy pipeline at 100% utilization, where
+        the probes counted WORKING agents/workers as "blocked", was
+        killed by the kill switch after ~3 minutes of full load).
         """
         if not self._deadlock_enabled or not self._deadlock_probes:
+            return None
+        # No-progress gate FIRST: while any observable progress happened
+        # within the probe window, the system is alive by definition.
+        if self.seconds_since_progress < self._deadlock_probe_seconds:
+            self._last_deadlock_check = time.monotonic()
             return None
         reports = []
         all_blocked = True

@@ -225,6 +225,20 @@ class QueryEngine:
         """Update the active permission checker for future turns."""
         self._permission_checker = checker
 
+    def _drop_stale_coordinator_context(self) -> None:
+        """Remove trailing coordinator-context user messages before a turn.
+
+        A mid-turn exit (max turns / API error) can leave the ephemeral
+        ``# Coordinator User Context`` message as the last history item.
+        Keeping it there breaks ``has_pending_continuation`` (the last
+        message is no longer the tool-results turn) and goes stale once
+        the next turn rebuilds a fresh context — so drop it.
+        """
+        while self._messages and self._messages[-1].role == "user" and self._messages[
+            -1
+        ].text.startswith("# Coordinator User Context"):
+            self._messages.pop()
+
     def _build_coordinator_context_message(self) -> ConversationMessage | None:
         """Build a synthetic user message carrying coordinator runtime context."""
         context = get_coordinator_user_context()
@@ -337,6 +351,7 @@ class QueryEngine:
             remember_user_goal(self._tool_metadata, user_message.text)
         self._prepare_session_memory()
         self._messages = sanitize_conversation_messages(self._messages)
+        self._drop_stale_coordinator_context()
         self._messages.append(user_message)
         if self._hook_executor is not None:
             await self._hook_executor.execute(
@@ -388,6 +403,27 @@ class QueryEngine:
                 yield event
         finally:
             self._active_query_messages = None
+            # ALWAYS adopt the final state of the working copy. The loop
+            # above only adopted at AssistantTurnComplete, but run_query
+            # appends tool results AFTER that yield and can then exit via
+            # MaxTurnsExceeded / a mid-loop API error / an empty-assistant
+            # drop / consumer cancellation. Without this final adoption
+            # the engine history ended with a dangling assistant
+            # tool_use and no tool results — the executed results were
+            # lost, /continue saw nothing pending, and the next
+            # submit_message's sanitizer deleted the whole turn.
+            # The EPHEMERAL coordinator context message (if it is the
+            # last message — mid-turn exits leave it trailing) is dropped
+            # before adoption: it is per-turn runtime context, not history.
+            try:
+                adoptable = list(query_messages)
+                while adoptable and adoptable[-1].role == "user" and adoptable[
+                    -1
+                ].text.startswith("# Coordinator User Context"):
+                    adoptable.pop()
+                self._adopt_query_messages(adoptable, version_at_start=version_at_start)
+            except Exception:
+                pass  # history adoption must never mask the original outcome
             await self._update_session_memory()
             await self._extract_durable_memories()
             self._schedule_auto_dream()
@@ -431,6 +467,7 @@ class QueryEngine:
         """Continue an interrupted tool loop without appending a new user message."""
         self._prepare_session_memory()
         self._messages = sanitize_conversation_messages(self._messages)
+        self._drop_stale_coordinator_context()
         context = QueryContext(
             api_client=self._api_client,
             tool_registry=self._tool_registry,
@@ -469,5 +506,18 @@ class QueryEngine:
                 yield event
         finally:
             self._active_query_messages = None
+            # Same always-adopt-on-exit rule as submit_message: tool
+            # results appended after the last AssistantTurnComplete must
+            # survive abnormal loop exits (max-turns, API error, abort),
+            # while the ephemeral trailing coordinator context is dropped.
+            try:
+                adoptable = list(query_messages)
+                while adoptable and adoptable[-1].role == "user" and adoptable[
+                    -1
+                ].text.startswith("# Coordinator User Context"):
+                    adoptable.pop()
+                self._adopt_query_messages(adoptable, version_at_start=version_at_start)
+            except Exception:
+                pass
             await self._update_session_memory()
             await self._extract_durable_memories()

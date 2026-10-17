@@ -6,7 +6,7 @@ import re
 
 from pydantic import BaseModel, Field, create_model
 
-from openharness.mcp.client import McpClientManager, McpServerNotConnectedError
+from openharness.mcp.client import McpClientManager, McpServerNotConnectedError, McpToolExecutionError
 from openharness.mcp.types import McpToolInfo
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
@@ -32,6 +32,10 @@ class McpToolAdapter(BaseTool):
                 arguments.model_dump(mode="json", exclude_none=True),
             )
         except McpServerNotConnectedError as exc:
+            return ToolResult(output=str(exc), is_error=True)
+        except McpToolExecutionError as exc:
+            # The server ran the tool and reported isError=True — the
+            # model must see a FAILURE, not a successful result.
             return ToolResult(output=str(exc), is_error=True)
         return ToolResult(output=output)
 

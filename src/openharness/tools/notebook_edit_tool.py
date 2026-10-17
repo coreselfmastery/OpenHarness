@@ -51,7 +51,17 @@ class NotebookEditTool(BaseTool):
             cell.setdefault("execution_count", None)
 
         existing = _normalize_source(cell.get("source", ""))
-        updated = arguments.new_source if arguments.mode == "replace" else f"{existing}{arguments.new_source}"
+        if arguments.mode == "replace":
+            updated = arguments.new_source
+        else:
+            # Append with a newline separator: concatenating directly
+            # fused two code lines into one (``print(1)`` + ``print(2)``
+            # became ``print(1)print(2)`` — a syntax error).
+            updated = (
+                f"{existing}\n{arguments.new_source}"
+                if existing and not existing.endswith("\n")
+                else f"{existing}{arguments.new_source}"
+            )
         cell["source"] = updated
 
         path.parent.mkdir(parents=True, exist_ok=True)

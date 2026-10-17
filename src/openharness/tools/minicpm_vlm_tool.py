@@ -85,7 +85,10 @@ def _extract_video_frames(video_path: Path, frame_count: int) -> list[Path]:
     """Extract up to ``frame_count`` evenly-spaced frames to a temp dir.
 
     Returns an empty list when OpenCV is unavailable or the video cannot
-    be opened — the caller surfaces that honestly.
+    be opened — the caller surfaces that honestly. Callers MUST clean up
+    with :func:`_cleanup_extracted_frames` once done (every call leaks a
+    ``minicpm-frames-*`` directory otherwise — a 200-scene QA run left
+    200 dirs behind).
     """
     try:
         import tempfile
@@ -116,6 +119,19 @@ def _extract_video_frames(video_path: Path, frame_count: int) -> list[Path]:
         return written
     finally:
         capture.release()
+
+
+def _cleanup_extracted_frames(frame_paths: list[Path]) -> None:
+    """Remove the temp dir holding extracted video frames (never raises)."""
+    if not frame_paths:
+        return
+    parent = frame_paths[0].parent
+    # Only remove dirs this module created (the mkdtemp prefix), never
+    # an arbitrary parent of caller-supplied image paths.
+    if parent.name.startswith("minicpm-frames-"):
+        import shutil
+
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 async def _post_chat_completion(
@@ -256,11 +272,14 @@ class MiniCPMVLMTool(BaseTool):
                     ),
                     is_error=True,
                 )
-            for frame_path in frame_paths:
-                encoded = _encode_image(frame_path)
-                if encoded is not None:
-                    data_uris.append(encoded[0])
-                    sources.append(str(frame_path))
+            try:
+                for frame_path in frame_paths:
+                    encoded = _encode_image(frame_path)
+                    if encoded is not None:
+                        data_uris.append(encoded[0])
+                        sources.append(str(frame_path))
+            finally:
+                _cleanup_extracted_frames(frame_paths)
 
         if not data_uris:
             return ToolResult(

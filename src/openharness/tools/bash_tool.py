@@ -58,11 +58,48 @@ class BashTool(BaseTool):
             raise
 
         try:
-            await asyncio.wait_for(process.wait(), timeout=arguments.timeout_seconds)
-        except asyncio.TimeoutError:
-            output_buffer = await _drain_available_output(process.stdout)
-            await _terminate_process(process, force=True)
-            output_buffer.extend(await _read_remaining_output(process))
+            # communicate() reads stdout WHILE waiting for exit. The old
+            # ``wait()``-only form deadlocked on any command producing
+            # more than the ~64 KB pipe/pty buffer: the child blocked in
+            # write(), wait() never returned, and the tool burned the
+            # full timeout then falsely reported "timed out".
+            # The task is kept (not wrapped in wait_for) so a TIMEOUT
+            # cannot discard the output communicate already buffered:
+            # the process is killed, the pipes close, communicate returns
+            # the partial output it captured before the deadline.
+            communicate_task: asyncio.Task = asyncio.create_task(process.communicate())
+            done, _pending = await asyncio.wait(
+                {communicate_task}, timeout=arguments.timeout_seconds
+            )
+            timed_out = not done
+            if timed_out:
+                await _terminate_process(process, force=True)
+                try:
+                    # Short grace: after the kill the pipes close and a
+                    # REAL communicate() returns in milliseconds with the
+                    # buffered partial output. (A long grace here would
+                    # add dead latency to every timeout, and fake
+                    # processes whose read never observes the kill are
+                    # cancelled instead.)
+                    await asyncio.wait_for(communicate_task, timeout=0.5)
+                except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - defensive
+                    communicate_task.cancel()
+        except asyncio.CancelledError:
+            communicate_task.cancel()
+            await _terminate_process(process, force=False)
+            raise
+
+        if timed_out:
+            output_buffer = bytearray()
+            if communicate_task.done() and not communicate_task.cancelled():
+                try:
+                    partial, _ = communicate_task.result()
+                    output_buffer.extend(partial or b"")
+                except Exception:  # noqa: BLE001 - partial output is best-effort
+                    pass
+            if not output_buffer:
+                output_buffer.extend(await _drain_available_output(process.stdout))
+                output_buffer.extend(await _read_remaining_output(process))
             return ToolResult(
                 output=_format_timeout_output(
                     output_buffer,
@@ -72,11 +109,9 @@ class BashTool(BaseTool):
                 is_error=True,
                 metadata={"returncode": process.returncode, "timed_out": True},
             )
-        except asyncio.CancelledError:
-            await _terminate_process(process, force=False)
-            raise
 
-        output_buffer = await _read_remaining_output(process)
+        stdout, _ = await communicate_task
+        output_buffer = bytearray(stdout or b"")
         text = _format_output(output_buffer)
         return ToolResult(
             output=text,
@@ -137,7 +172,12 @@ def _format_output(output_buffer: bytearray) -> str:
     if not text:
         return "(no output)"
     if len(text) > 12000:
-        return f"{text[:12000]}\n...[truncated]..."
+        # Head + tail: for build/test logs the actionable part (errors,
+        # summary) is at the END — a head-only truncation silently
+        # dropped exactly the part the model needs to diagnose failures.
+        head = text[:9000]
+        tail = text[-2500:]
+        return f"{head}\n...[{len(text) - 9000 - 2500} chars truncated]...\n{tail}"
     return text
 
 

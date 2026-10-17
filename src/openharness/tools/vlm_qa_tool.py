@@ -37,6 +37,7 @@ from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from openharness.tools.minicpm_vlm_tool import (
     _encode_image,
     _extract_video_frames,
+    _cleanup_extracted_frames,
     _post_chat_completion,
     _resolve_config,
 )
@@ -218,10 +219,13 @@ class VLMQATool(BaseTool):
                 continue
 
             data_uris: list[str] = []
-            for frame_path in frame_paths:
-                encoded = _encode_image(frame_path)
-                if encoded is not None:
-                    data_uris.append(encoded[0])
+            try:
+                for frame_path in frame_paths:
+                    encoded = _encode_image(frame_path)
+                    if encoded is not None:
+                        data_uris.append(encoded[0])
+            finally:
+                _cleanup_extracted_frames(frame_paths)
             if not data_uris:
                 entry.update({"error": "frames unreadable", "passed": False})
                 results.append(entry)

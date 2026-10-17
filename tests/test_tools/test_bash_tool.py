@@ -57,6 +57,18 @@ class _FakeProcess:
             await asyncio.sleep(60)
         return self.returncode
 
+    async def communicate(self):
+        """Fake of asyncio.Process.communicate for the tool's capture path."""
+        data = bytearray()
+        if self.stdout is not None:
+            while True:
+                chunk = await self.stdout.read(65536)
+                if not chunk:
+                    break
+                data.extend(chunk)
+        await self.wait()
+        return bytes(data), b""
+
     def terminate(self):
         self.terminated = True
         self.returncode = -15

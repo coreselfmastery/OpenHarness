@@ -39,7 +39,11 @@ _ASSET_PATTERNS: tuple[tuple[str, str], ...] = (
     ("hyperframes", r"""["']([^"']+\.(?:png|jpg|jpeg|webp|svg|gif|mp3|wav|ogg|mp4|webm|ttf|otf|woff2?))["']"""),
     ("manim", r"""["']([^"']+\.(?:png|jpg|jpeg|webp|svg|gif|mp3|wav|ogg|mp4|svg|ttf|otf))["']"""),
     ("blender", r"""["']([^"']+\.(?:blend|png|jpg|jpeg|hdr|exr|fbx|obj|stl|glb|gltf))["']"""),
-    ("ffmpeg", r"""["'\s](?:-\i\s+)?([^\s"']+\.(?:png|jpg|jpeg|webp|svg|mp3|wav|ogg|mp4|webm|mov|srt|ass|ttf))["']?"""),
+    # NOTE: ``-\i`` below is the ffmpeg ``-i`` (input) flag — it MUST be
+    # ``-i``, not ``\i``: a backslash makes this an invalid regex escape
+    # (``re.error: bad escape \i``) which crashed every ffmpeg-engine
+    # fingerprint/asset scan at submit time.
+    ("ffmpeg", r"""["'\s](?:-i\s+)?([^\s"']+\.(?:png|jpg|jpeg|webp|svg|mp3|wav|ogg|mp4|webm|mov|srt|ass|ttf))["']?"""),
 )
 _DEFAULT_ASSET_PATTERN = _ASSET_PATTERNS[0][1]
 

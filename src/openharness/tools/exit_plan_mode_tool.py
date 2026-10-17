@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from openharness.config.settings import load_settings, save_settings
 from openharness.permissions import PermissionMode
+from openharness.tools.enter_plan_mode_tool import _rebuild_live_permission_checker
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
@@ -21,8 +22,10 @@ class ExitPlanModeTool(BaseTool):
     input_model = ExitPlanModeToolInput
 
     async def execute(self, arguments: ExitPlanModeToolInput, context: ToolExecutionContext) -> ToolResult:
-        del arguments, context
+        del arguments
         settings = load_settings()
         settings.permission.mode = PermissionMode.DEFAULT
         save_settings(settings)
-        return ToolResult(output="Permission mode set to default")
+        applied = _rebuild_live_permission_checker(context)
+        note = " (live session updated)" if applied else " (live session: restart to apply)"
+        return ToolResult(output=f"Permission mode set to default{note}")

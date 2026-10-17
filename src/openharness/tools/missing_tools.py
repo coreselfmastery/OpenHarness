@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -316,7 +317,12 @@ class AudioQATool(BaseTool):
             )
 
         try:
-            m = _measure_audio(
+            # ``_measure_audio`` chains up to three ffmpeg subprocess
+            # passes (~180s worst case) — run it in a worker thread so it
+            # cannot freeze the event loop (concurrent agents, watchdog
+            # feeding, UI) for the whole measurement.
+            m = await asyncio.to_thread(
+                _measure_audio,
                 path,
                 silence_threshold_db=-40.0,
                 min_silence=arguments.min_silence_seconds,
@@ -613,16 +619,20 @@ class ContactSheetTool(BaseTool):
 
                 for video in video_inputs:
                     tmp = Path(tempfile.mktemp(suffix=".png"))
-                    extract = _run_ffmpeg([
-                        "-ss", "0", "-i", str(video),
-                        "-frames:v", "1", "-y", str(tmp),
-                    ], timeout=30)
+                    extract = await asyncio.to_thread(
+                        _run_ffmpeg,
+                        [
+                            "-ss", "0", "-i", str(video),
+                            "-frames:v", "1", "-y", str(tmp),
+                        ],
+                        timeout=30,
+                    )
                     if extract.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
                         temp_thumbs.append(tmp)
                         thumbs.append(tmp)
                         included.append(str(video))
                         included_paths.append(video)
-                        durations.append(_video_duration_s(video))
+                        durations.append(await asyncio.to_thread(_video_duration_s, video))
                         included_count += 1
                     else:
                         missing.append(video.name)
@@ -631,8 +641,12 @@ class ContactSheetTool(BaseTool):
                         labels = _scene_labels(
                             durations, arguments.timestamps, included_count
                         )
-                        _composite_grid(
-                            thumbs, output_path, arguments, labels=labels
+                        await asyncio.to_thread(
+                            _composite_grid,
+                            thumbs,
+                            output_path,
+                            arguments,
+                            labels=labels,
                         )
                         composited = True
                 finally:
@@ -862,8 +876,14 @@ def route_engine(description: str, available: list[str]) -> str:
     if any(kw in lowered for kw in ["3d", "blender", "three.js", "webgl", "shader"]):
         if "blender" in available:
             return "blender"
-    # Math animations → Manim
-    if any(kw in lowered for kw in ["manim", "math", "equation", "graph", "geometry", "proof"]):
+    # Math animations → Manim. Word-boundary matching: plain substring
+    # matching sent "paragraph" (contains "graph") to Manim.
+    import re as _re
+
+    if any(
+        _re.search(rf"\b{_re.escape(kw)}\b", lowered)
+        for kw in ["manim", "math", "equation", "graph", "geometry", "proof"]
+    ):
         if "manim" in available:
             return "manim"
     # Video compositing → FFmpeg

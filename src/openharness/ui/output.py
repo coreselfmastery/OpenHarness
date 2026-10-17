@@ -9,6 +9,7 @@ from rich.syntax import Syntax
 
 from openharness.engine.stream_events import (
     AssistantTextDelta,
+    AssistantTextReset,
     AssistantTurnComplete,
     CompactProgressEvent,
     StreamEvent,
@@ -58,6 +59,13 @@ class OutputRenderer:
             self._assistant_buffer += event.text
             # Stream raw text for responsiveness
             self.console.print(event.text, end="", markup=False, highlight=False)
+            return
+
+        if isinstance(event, AssistantTextReset):
+            # A mid-stream retry restarts the response: discard the partial
+            # first attempt so the final render (and any markdown re-render)
+            # shows only the retried text, not the partial + full duplicate.
+            self._assistant_buffer = ""
             return
 
         if isinstance(event, AssistantTurnComplete):
