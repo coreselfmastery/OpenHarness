@@ -161,7 +161,7 @@ class PixelQATool(BaseTool):
                     is_error=True,
                 )
 
-        enabled = set(arguments.checkes) if arguments.checks else None
+        enabled = set(arguments.checks) if arguments.checks else None
         qa = PixelQA()
         reports = []
         for video in videos:

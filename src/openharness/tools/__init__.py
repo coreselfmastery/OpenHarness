@@ -1,9 +1,9 @@
 """Built-in tool registration."""
 
-from openharness.tools.ask_user_question_tool import AskUserQuestionTool
 from openharness.tools.agent_tool import AgentTool
-from openharness.tools.bash_tool import BashTool
+from openharness.tools.ask_user_question_tool import AskUserQuestionTool
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
+from openharness.tools.bash_tool import BashTool
 from openharness.tools.batch_scene_tool import BatchSceneTool
 from openharness.tools.brand_kit_tool import BrandKitTool
 from openharness.tools.brief_tool import BriefTool
@@ -16,9 +16,11 @@ from openharness.tools.enter_plan_mode_tool import EnterPlanModeTool
 from openharness.tools.enter_worktree_tool import EnterWorktreeTool
 from openharness.tools.exit_plan_mode_tool import ExitPlanModeTool
 from openharness.tools.exit_worktree_tool import ExitWorktreeTool
+from openharness.tools.failure_patterns_tool import FailurePatternsTool
 from openharness.tools.file_edit_tool import FileEditTool
 from openharness.tools.file_read_tool import FileReadTool
 from openharness.tools.file_write_tool import FileWriteTool
+from openharness.tools.frame_diff_tool import FrameDiffTool
 from openharness.tools.glob_tool import GlobTool
 from openharness.tools.grep_tool import GrepTool
 from openharness.tools.image_generation_tool import ImageGenerationTool
@@ -28,6 +30,13 @@ from openharness.tools.lsp_tool import LspTool
 from openharness.tools.mcp_auth_tool import McpAuthTool
 from openharness.tools.mcp_tool import McpToolAdapter
 from openharness.tools.minicpm_vlm_tool import MiniCPMVLMTool
+from openharness.tools.missing_tools import (
+    AudioQATool,
+    ContactSheetTool,
+    CostGovernorTool,
+    DeterminismCheckerTool,
+    EngineRouterTool,
+)
 from openharness.tools.notebook_edit_tool import NotebookEditTool
 from openharness.tools.pipeline_tools import (
     AudioGenTool,
@@ -43,11 +52,16 @@ from openharness.tools.pipeline_tools import (
     ServerConfigTool,
 )
 from openharness.tools.pixel_qa_tool import PixelQATool
+from openharness.tools.prompt_tracker_tool import PromptTrackerTool
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 from openharness.tools.remote_trigger_tool import RemoteTriggerTool
+from openharness.tools.scene_lint_tool import SceneLintTool
+from openharness.tools.semantic_memory_tool import SemanticMemoryTool
 from openharness.tools.send_message_tool import SendMessageTool
 from openharness.tools.skill_tool import SkillTool
 from openharness.tools.sleep_tool import SleepTool
+from openharness.tools.style_consistency_tool import StyleConsistencyTool
+from openharness.tools.style_memory_tool import StyleMemoryTool
 from openharness.tools.task_create_tool import TaskCreateTool
 from openharness.tools.task_get_tool import TaskGetTool
 from openharness.tools.task_list_tool import TaskListTool
@@ -58,15 +72,9 @@ from openharness.tools.team_create_tool import TeamCreateTool
 from openharness.tools.team_delete_tool import TeamDeleteTool
 from openharness.tools.todo_write_tool import TodoWriteTool
 from openharness.tools.tool_search_tool import ToolSearchTool
+from openharness.tools.vlm_qa_tool import VLMQATool
 from openharness.tools.web_fetch_tool import WebFetchTool
 from openharness.tools.web_search_tool import WebSearchTool
-from openharness.tools.missing_tools import (
-    CostGovernorTool,
-    AudioQATool,
-    DeterminismCheckerTool,
-    ContactSheetTool,
-    EngineRouterTool,
-)
 
 
 def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
@@ -135,6 +143,16 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         # Video QA: deterministic pixel inspection + local MiniCPM-V 4.5 VLM
         PixelQATool(),
         MiniCPMVLMTool(),
+        # Video QA wave 2: motion, code-level lint, selective VLM rubric
+        FrameDiffTool(),
+        SceneLintTool(),
+        VLMQATool(),
+        StyleConsistencyTool(),
+        # Learning stores: the harness gets better over time
+        SemanticMemoryTool(),
+        StyleMemoryTool(),
+        FailurePatternsTool(),
+        PromptTrackerTool(),
     ):
         registry.register(tool)
     if mcp_manager is not None:

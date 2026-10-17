@@ -539,6 +539,18 @@ class ContactSheetToolInput(BaseModel):
     columns: int = Field(default=4, ge=1, le=10, description="Number of columns in the grid")
     thumbnail_width: int = Field(default=320, ge=32, description="Width of each thumbnail in pixels")
     background_color: str = Field(default="black", description="Padding/background colour for non-16:9 thumbnails")
+    timestamps: list[float] | None = Field(
+        default=None,
+        description=(
+            "Optional per-input scene start times in seconds (final-cut "
+            "order). When omitted they are computed as cumulative video "
+            "durations (videos contribute their length, images 0)."
+        ),
+    )
+    label_cells: bool = Field(
+        default=True,
+        description="Label each cell with its scene number and timestamp (needs a system TTF font).",
+    )
 
 
 class ContactSheetTool(BaseTool):
@@ -585,9 +597,12 @@ class ContactSheetTool(BaseTool):
         composited = False
         composite_error: str = ""
         # Inputs that made it into the grid (images + videos whose first
-        # frame decoded successfully).
+        # frame decoded successfully), in final-cut order.
         included_count = len(image_inputs)
         included: list[str] = [str(p) for p in image_inputs]
+        included_paths: list[Path] = list(image_inputs)
+        # Per-included-file durations for cumulative timestamps.
+        durations: list[float] = [0.0] * len(image_inputs)
 
         if ffmpeg_available:
             try:
@@ -606,12 +621,19 @@ class ContactSheetTool(BaseTool):
                         temp_thumbs.append(tmp)
                         thumbs.append(tmp)
                         included.append(str(video))
+                        included_paths.append(video)
+                        durations.append(_video_duration_s(video))
                         included_count += 1
                     else:
                         missing.append(video.name)
                 try:
                     if thumbs:
-                        _composite_grid(thumbs, output_path, arguments)
+                        labels = _scene_labels(
+                            durations, arguments.timestamps, included_count
+                        )
+                        _composite_grid(
+                            thumbs, output_path, arguments, labels=labels
+                        )
                         composited = True
                 finally:
                     for tmp in temp_thumbs:
@@ -634,12 +656,25 @@ class ContactSheetTool(BaseTool):
         rows = (max(1, included_count) + cols - 1) // cols
         thumb_w = arguments.thumbnail_width
         thumb_h = int(thumb_w * 9 / 16)
+        cell_timestamps = _scene_labels(durations, arguments.timestamps, included_count)
+        cells = [
+            {
+                "position": index,
+                "col": index % cols,
+                "row": index // cols,
+                "file": included[index],
+                "scene": index + 1,
+                "timestamp_s": round(cell_timestamps[index], 2),
+            }
+            for index in range(included_count)
+        ]
         manifest = {
             "output_path": str(output_path),
             "image_composited": composited,
             "included": included,
             "missing_files": missing,
             "grid": {"cols": cols, "rows": rows, "thumb_w": thumb_w, "thumb_h": thumb_h},
+            "cells": cells,
         }
         manifest_path = output_path.with_suffix(".json")
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -668,26 +703,100 @@ class ContactSheetTool(BaseTool):
         )
 
 
-def _composite_grid(thumbs: list[Path], output_path: Path, arguments: ContactSheetToolInput) -> None:
-    """Scale/pad every input to the thumbnail size and xstack them into a grid."""
+def _video_duration_s(video: Path) -> float:
+    """Best-effort video duration in seconds (OpenCV, else 0)."""
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(str(video))
+        if not capture.isOpened():
+            return 0.0
+        try:
+            frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            return (frames / fps) if frames and fps else 0.0
+        finally:
+            capture.release()
+    except Exception:  # noqa: BLE001 - label timing is best-effort
+        return 0.0
+
+
+def _scene_labels(
+    durations: list[float],
+    explicit: list[float] | None,
+    count: int,
+) -> list[float]:
+    """Per-cell start timestamps: explicit when given, else cumulative."""
+    if explicit is not None and len(explicit) >= count:
+        return [float(explicit[i]) for i in range(count)]
+    labels: list[float] = []
+    running = 0.0
+    for index in range(count):
+        labels.append(running)
+        running += float(durations[index]) if index < len(durations) else 0.0
+    return labels
+
+
+_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+]
+
+
+def _find_label_font() -> str | None:
+    """First existing TTF for drawtext labels, or None."""
+    for candidate in _FONT_CANDIDATES:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _composite_grid(
+    thumbs: list[Path],
+    output_path: Path,
+    arguments: ContactSheetToolInput,
+    *,
+    labels: list[float] | None = None,
+) -> None:
+    """Scale/pad every input to the thumbnail size and xstack them into a grid.
+
+    When ``labels`` are provided (and a system TTF font exists) each cell is
+    stamped with ``S<n> <t>s`` — scene number + final-cut start timestamp.
+    """
     w = arguments.thumbnail_width
     h = int(w * 9 / 16)
     n = len(thumbs)
     cols = min(arguments.columns, n)
     bg = arguments.background_color
 
+    font = _find_label_font() if (arguments.label_cells and labels) else None
+
     args: list[str] = []
     for t in thumbs:
         args += ["-i", str(t)]
 
-    # Per-input: scale to fit, then pad to the exact cell size.
+    # Per-input: scale to fit, then pad to the exact cell size, then label.
     filter_parts = []
     for i in range(n):
-        filter_parts.append(
+        chain = (
             f"[{i}]scale={w}:{h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={bg},"
-            f"setsar=1[t{i}]"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={bg}"
         )
+        if font is not None:
+            timestamp = labels[i] if labels and i < len(labels) else 0.0
+            text = f"S{i + 1} {timestamp:.1f}s"
+            font_size = max(12, w // 16)
+            chain += (
+                f",drawtext=fontfile='{font}':text='{text}'"
+                f":x=8:y=h-th-8:fontsize={font_size}:fontcolor=white"
+                ":box=1:boxcolor=black@0.55:boxborderw=6"
+            )
+        chain += f",setsar=1[t{i}]"
+        filter_parts.append(chain)
     if n == 1:
         filter_complex = ";".join(filter_parts) + ";[t0]null[out]"
     else:

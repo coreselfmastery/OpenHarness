@@ -24,7 +24,6 @@ from openharness.permissions.modes import PermissionMode
 from openharness.utils.file_lock import exclusive_file_lock
 from openharness.utils.fs import atomic_write_text
 
-
 # ANSI escape sequence pattern
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -450,7 +449,7 @@ def _slugify_profile_name(value: str) -> str:
     return cleaned or "custom"
 
 
-def _infer_profile_name_from_flat_settings(settings: "Settings") -> str:
+def _infer_profile_name_from_flat_settings(settings: Settings) -> str:
     provider = (settings.provider or "").strip()
     if provider == "openai_codex":
         return "codex"
@@ -469,7 +468,7 @@ def _infer_profile_name_from_flat_settings(settings: "Settings") -> str:
     return "claude-api"
 
 
-def _profile_from_flat_settings(settings: "Settings") -> tuple[str, ProviderProfile]:
+def _profile_from_flat_settings(settings: Settings) -> tuple[str, ProviderProfile]:
     defaults = default_provider_profiles()
     name = _infer_profile_name_from_flat_settings(settings)
     existing = defaults.get(name)
@@ -517,7 +516,7 @@ class ImageGenerationConfig(BaseModel):
     codex_base_url: str = ""
 
     @classmethod
-    def from_env(cls) -> "ImageGenerationConfig":
+    def from_env(cls) -> ImageGenerationConfig:
         """Load image generation config from environment variables."""
         return cls(
             provider=os.environ.get("OPENHARNESS_IMAGE_GENERATION_PROVIDER", "auto").strip()
@@ -552,7 +551,7 @@ class SceneGenConfig(BaseModel):
     temperature: float = 0.7
 
     @classmethod
-    def from_env(cls) -> "SceneGenConfig":
+    def from_env(cls) -> SceneGenConfig:
         """Load scene gen config from environment variables."""
         return cls(
             model=os.environ.get("OPENHARNESS_SCENE_GEN_MODEL", "gpt-4o").strip() or "gpt-4o",
@@ -580,7 +579,7 @@ class VisionModelConfig(BaseModel):
     base_url: str = ""
 
     @classmethod
-    def from_env(cls) -> "VisionModelConfig":
+    def from_env(cls) -> VisionModelConfig:
         """Load vision model config from environment variables."""
         return cls(
             model=os.environ.get("OPENHARNESS_VISION_MODEL", "").strip(),
@@ -618,7 +617,7 @@ class MiniCPMVLMConfig(BaseModel):
     vram_gb: str = "6-8"
 
     @classmethod
-    def from_env(cls) -> "MiniCPMVLMConfig":
+    def from_env(cls) -> MiniCPMVLMConfig:
         """Load MiniCPM-V config from environment variables, keeping the
         class defaults for anything unset."""
         return cls(
@@ -636,6 +635,44 @@ class MiniCPMVLMConfig(BaseModel):
     @property
     def is_configured(self) -> bool:
         """Always True — the defaults target a local endpoint."""
+        return bool(self.base_url and self.model)
+
+
+class EmbeddingConfig(BaseModel):
+    """Embedding endpoint for the semantic-memory store.
+
+    Any OpenAI-compatible ``/embeddings`` server works — BGE-M3
+    (``BAAI/bge-m3``, 768 dims), MiniLM
+    (``sentence-transformers/all-MiniLM-L6-v2``, 384 dims), or an
+    ``ollama serve`` gateway. When ``base_url`` is empty the semantic
+    memory falls back to a deterministic local hashing embedder
+    (lexical-approximate recall, zero dependencies) so the store
+    always works.
+    """
+
+    base_url: str = ""  # empty -> local hashing fallback
+    model: str = "BAAI/bge-m3"
+    api_key: str = "EMPTY"
+    timeout_seconds: float = 30.0
+
+    @classmethod
+    def from_env(cls) -> EmbeddingConfig:
+        """Load embedding config from environment variables, keeping the
+        class defaults for anything unset."""
+        return cls(
+            base_url=os.environ.get("OPENHARNESS_EMBEDDING_BASE_URL", "").strip(),
+            model=os.environ.get("OPENHARNESS_EMBEDDING_MODEL", "").strip()
+            or cls.model_fields["model"].default,
+            api_key=os.environ.get("OPENHARNESS_EMBEDDING_API_KEY", "").strip()
+            or "EMPTY",
+            timeout_seconds=float(
+                os.environ.get("OPENHARNESS_EMBEDDING_TIMEOUT", "0").strip() or 0
+            )
+            or cls.model_fields["timeout_seconds"].default,
+        )
+
+    @property
+    def is_configured(self) -> bool:
         return bool(self.base_url and self.model)
 
 
@@ -878,6 +915,8 @@ class Settings(BaseModel):
 
     # Local MiniCPM-V 4.5 VLM (minicpm_vlm tool)
     minicpm_v: MiniCPMVLMConfig = Field(default_factory=MiniCPMVLMConfig)
+    # Embedding endpoint for the semantic-memory store
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 
     # Image generation model
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)

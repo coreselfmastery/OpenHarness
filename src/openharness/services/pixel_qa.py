@@ -122,13 +122,16 @@ class ScenePixelReport:
 # Brand palette loading
 # ----------------------------------------------------------------------
 
-def load_brand_palette(source: str | Path) -> list[tuple[int, int, int]]:
+def load_brand_palette(
+    source: str | Path, *, as_hex: bool = False
+) -> list[tuple[int, int, int]] | list[str]:
     """Load hex colors from a brand file or an OpenVideoHarness tokens.json.
 
     Accepts ``brand.yaml``/``brand.yml``/``brand.json`` (any mapping whose
     nested values include ``#rrggbb`` strings) and the OpenVideoHarness
     ``styles/<slug>/tokens.json`` layout (``palette.bg/fg/accent/extra``).
-    Returns BGR tuples (OpenCV order); empty list when nothing loads.
+    Returns BGR tuples (OpenCV order) by default, or ``#RRGGBB`` strings
+    when ``as_hex=True``; empty list when nothing loads.
     """
     path = Path(source)
     if not path.is_file():
@@ -154,11 +157,17 @@ def load_brand_palette(source: str | Path) -> list[tuple[int, int, int]]:
             data = None
     if not isinstance(data, dict):
         return []
-    return palette_from_mapping(data)
+    return palette_from_mapping(data, as_hex=as_hex)
 
 
-def palette_from_mapping(data: dict[str, Any]) -> list[tuple[int, int, int]]:
-    """Collect every ``#rrggbb`` string from a nested mapping -> BGR tuples."""
+def palette_from_mapping(
+    data: dict[str, Any], *, as_hex: bool = False
+) -> list[tuple[int, int, int]] | list[str]:
+    """Collect every ``#rrggbb`` string from a nested mapping.
+
+    Returns BGR tuples (OpenCV order) by default, or the deduplicated
+    ``#RRGGBB`` strings themselves when ``as_hex=True``.
+    """
     hexes: list[str] = []
 
     def _walk(node: Any) -> None:
@@ -175,13 +184,15 @@ def palette_from_mapping(data: dict[str, Any]) -> list[tuple[int, int, int]]:
 
     _walk(data)
     seen: set[str] = set()
-    palette: list[tuple[int, int, int]] = []
+    unique_hexes: list[str] = []
     for hex_color in hexes:
         if hex_color.lower() in seen:
             continue
         seen.add(hex_color.lower())
-        palette.append(hex_to_bgr(hex_color))
-    return palette
+        unique_hexes.append(hex_color)
+    if as_hex:
+        return unique_hexes
+    return [hex_to_bgr(hex_color) for hex_color in unique_hexes]
 
 
 def hex_to_bgr(hex_color: str) -> tuple[int, int, int]:
