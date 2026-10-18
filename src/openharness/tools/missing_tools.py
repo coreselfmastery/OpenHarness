@@ -564,9 +564,10 @@ class ContactSheetTool(BaseTool):
     description = (
         "Composite rendered scenes into a single contact-sheet image (grid "
         "of thumbnails) for fast visual QA. Images are scaled and padded; "
-        "videos contribute their first frame. Uses ffmpeg; when ffmpeg is "
-        "missing or no input can be decoded, writes a JSON manifest only "
-        "and says so explicitly."
+        "videos contribute their first frame (ffmpeg when available, else "
+        "OpenCV). Inputs keep the caller's final-cut order. When neither "
+        "decoder can produce a thumbnail and no input can be decoded, "
+        "writes a JSON manifest only and says so explicitly."
     )
     input_model = ContactSheetToolInput
 
@@ -578,21 +579,23 @@ class ContactSheetTool(BaseTool):
         if not output_path.is_absolute():
             output_path = context.cwd / output_path
 
-        # Resolve inputs, split into images / videos / missing.
-        image_inputs: list[Path] = []
-        video_inputs: list[Path] = []
+        # Make sure the output directory exists before any writer runs.
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Resolve inputs, keeping the caller's final-cut order. Mixed
+        # image/video lists must NOT be regrouped by type — the sheet's
+        # scene numbering and cumulative timestamps follow this order.
         missing: list[str] = []
+        ordered: list[tuple[Path, bool]] = []  # (path, is_video)
         for f in arguments.scene_files:
             p = Path(f)
             if not p.is_absolute():
                 p = context.cwd / p
-            if not p.is_file():
-                missing.append(f)
-                continue
-            if p.suffix.lower() in _IMAGE_EXTENSIONS:
-                image_inputs.append(p)
-            elif p.suffix.lower() in _VIDEO_EXTENSIONS:
-                video_inputs.append(p)
+            suffix = p.suffix.lower()
+            if p.is_file() and suffix in _IMAGE_EXTENSIONS:
+                ordered.append((p, False))
+            elif p.is_file() and suffix in _VIDEO_EXTENSIONS:
+                ordered.append((p, True))
             else:
                 missing.append(f)
 
@@ -604,61 +607,63 @@ class ContactSheetTool(BaseTool):
         composite_error: str = ""
         # Inputs that made it into the grid (images + videos whose first
         # frame decoded successfully), in final-cut order.
-        included_count = len(image_inputs)
-        included: list[str] = [str(p) for p in image_inputs]
-        included_paths: list[Path] = list(image_inputs)
+        included: list[str] = []
         # Per-included-file durations for cumulative timestamps.
-        durations: list[float] = [0.0] * len(image_inputs)
-
-        if ffmpeg_available:
-            try:
-                # Videos contribute a first-frame thumbnail via a temp file.
-                thumbs = list(image_inputs)
-                temp_thumbs: list[Path] = []
-                import tempfile
-
-                for video in video_inputs:
-                    tmp = Path(tempfile.mktemp(suffix=".png"))
-                    extract = await asyncio.to_thread(
-                        _run_ffmpeg,
-                        [
-                            "-ss", "0", "-i", str(video),
-                            "-frames:v", "1", "-y", str(tmp),
-                        ],
-                        timeout=30,
+        durations: list[float] = []
+        temp_thumbs: list[Path] = []
+        try:
+            thumbs: list[Path] = []
+            for path, is_video in ordered:
+                if not is_video:
+                    thumbs.append(path)
+                    included.append(str(path))
+                    durations.append(0.0)
+                    continue
+                # Videos contribute a first-frame thumbnail via a temp
+                # file — ffmpeg when available, OpenCV otherwise.
+                thumb = await asyncio.to_thread(
+                    _extract_video_thumb, path, ffmpeg_available
+                )
+                if thumb is None:
+                    missing.append(path.name)
+                    continue
+                thumbs.append(thumb)
+                included.append(str(path))
+                durations.append(await asyncio.to_thread(_video_duration_s, path))
+                if thumb != path:
+                    temp_thumbs.append(thumb)
+            included_count = len(included)
+            if thumbs:
+                labels = _scene_labels(
+                    durations, arguments.timestamps, included_count
+                )
+                if ffmpeg_available:
+                    await asyncio.to_thread(
+                        _composite_grid,
+                        thumbs,
+                        output_path,
+                        arguments,
+                        labels=labels,
                     )
-                    if extract.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
-                        temp_thumbs.append(tmp)
-                        thumbs.append(tmp)
-                        included.append(str(video))
-                        included_paths.append(video)
-                        durations.append(await asyncio.to_thread(_video_duration_s, video))
-                        included_count += 1
-                    else:
-                        missing.append(video.name)
+                else:
+                    # ffmpeg missing: PIL + OpenCV still produce a real
+                    # PNG grid instead of a manifest-only result.
+                    await asyncio.to_thread(
+                        _composite_grid_pil,
+                        thumbs,
+                        output_path,
+                        arguments,
+                        labels=labels,
+                    )
+                composited = True
+        except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+            composite_error = str(exc)
+        finally:
+            for tmp in temp_thumbs:
                 try:
-                    if thumbs:
-                        labels = _scene_labels(
-                            durations, arguments.timestamps, included_count
-                        )
-                        await asyncio.to_thread(
-                            _composite_grid,
-                            thumbs,
-                            output_path,
-                            arguments,
-                            labels=labels,
-                        )
-                        composited = True
-                finally:
-                    for tmp in temp_thumbs:
-                        try:
-                            tmp.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-            except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
-                composite_error = str(exc)
-        else:
-            composite_error = "ffmpeg not installed"
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if not composited and not composite_error:
             # All inputs failed to decode / none were compositable.
             composite_error = "no decodable image inputs"
@@ -733,6 +738,53 @@ def _video_duration_s(video: Path) -> float:
             capture.release()
     except Exception:  # noqa: BLE001 - label timing is best-effort
         return 0.0
+
+
+def _extract_video_thumb(video: Path, ffmpeg_available: bool) -> Path | None:
+    """First-frame thumbnail for a video: ffmpeg when available, OpenCV
+    (``cv2.VideoCapture``) as the ffmpeg-free fallback.
+
+    Returns a temp PNG path (the caller unlinks it), or ``None`` when
+    the video cannot be decoded at all.
+    """
+    import tempfile
+
+    tmp = Path(tempfile.mktemp(suffix=".png"))
+    if ffmpeg_available:
+        try:
+            extract = _run_ffmpeg(
+                ["-ss", "0", "-i", str(video), "-frames:v", "1", "-y", str(tmp)],
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if extract.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+            return tmp
+        return None
+    return _extract_frame_cv2(video, tmp)
+
+
+def _extract_frame_cv2(video: Path, out_png: Path) -> Path | None:
+    """OpenCV first-frame extraction — no ffmpeg required."""
+    try:
+        import cv2
+    except Exception:  # noqa: BLE001 - optional dependency
+        return None
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        return None
+    try:
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            return None
+        # ``frame`` is BGR and cv2.imwrite expects BGR — no swap needed.
+        if not cv2.imwrite(str(out_png), frame):
+            return None
+    finally:
+        capture.release()
+    if out_png.is_file() and out_png.stat().st_size > 0:
+        return out_png
+    return None
 
 
 def _scene_labels(
@@ -828,6 +880,117 @@ def _composite_grid(
     result = _run_ffmpeg(args, timeout=120)
     if result.returncode != 0 or not output_path.is_file():
         raise RuntimeError(_summarize_ffmpeg_error(result.stderr))
+
+
+_SHEET_BG_COLORS = {
+    "black": (0, 0, 0),
+    "white": (255, 255, 255),
+    "gray": (128, 128, 128),
+    "grey": (128, 128, 128),
+    "red": (211, 47, 47),
+    "green": (46, 125, 50),
+    "blue": (40, 90, 220),
+}
+
+
+def _sheet_bg_color(color: str) -> tuple[int, int, int]:
+    """Parse the background_color argument ('black', '#1a1a1a', ...)."""
+    value = (color or "black").strip().lower()
+    if value in _SHEET_BG_COLORS:
+        return _SHEET_BG_COLORS[value]
+    if value.startswith("#") and len(value) == 7:
+        try:
+            return (
+                int(value[1:3], 16),
+                int(value[3:5], 16),
+                int(value[5:7], 16),
+            )
+        except ValueError:
+            pass
+    return (0, 0, 0)
+
+
+def _composite_grid_pil(
+    thumbs: list[Path],
+    output_path: Path,
+    arguments: "ContactSheetToolInput",
+    *,
+    labels: list[float] | None = None,
+) -> None:
+    """ffmpeg-free grid composite: PIL scale/pad + optional labels.
+
+    Mirrors the ffmpeg xstack layout exactly — every input is scaled to
+    fit its cell (aspect preserved), padded to the cell size, and placed
+    at (col*w, row*h); labels are stamped bottom-left when a system TTF
+    font exists. Used when ffmpeg is not installed so a contact sheet is
+    still a real PNG grid, not a manifest-only stub.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    w = arguments.thumbnail_width
+    h = int(w * 9 / 16)
+    n = len(thumbs)
+    cols = min(arguments.columns, n)
+    rows = (n + cols - 1) // cols
+    bg = _sheet_bg_color(arguments.background_color)
+
+    sheet = Image.new("RGB", (cols * w, rows * h), bg)
+    draw = ImageDraw.Draw(sheet)
+
+    font = None
+    if arguments.label_cells and labels:
+        font_path = _find_label_font()
+        if font_path:
+            try:
+                font = ImageFont.truetype(font_path, max(12, w // 16))
+            except Exception:  # noqa: BLE001 - labels are best-effort
+                font = None
+
+    for index, thumb in enumerate(thumbs):
+        try:
+            with Image.open(thumb) as handle:
+                image = handle.convert("RGB")
+        except Exception as exc:  # noqa: BLE001 - surface as composite error
+            raise ValueError(f"thumbnail unreadable: {thumb}") from exc
+        # Scale to fit the cell (same semantics as ffmpeg's
+        # force_original_aspect_ratio=decrease), then pad centered — the
+        # sheet's background colour fills the padding.
+        scale = min(w / image.width, h / image.height)
+        image = image.resize(
+            (
+                max(1, round(image.width * scale)),
+                max(1, round(image.height * scale)),
+            ),
+            resampling,
+        )
+        sheet.paste(
+            image,
+            (
+                (index % cols) * w + (w - image.width) // 2,
+                (index // cols) * h + (h - image.height) // 2,
+            ),
+        )
+        if font is not None:
+            timestamp = labels[index] if labels and index < len(labels) else 0.0
+            text = f"S{index + 1} {timestamp:.1f}s"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            x0 = (index % cols) * w + 8
+            y0 = (index // cols) * h + h - text_h - 8
+            draw.rectangle(
+                [x0 - 6, y0 - 6, x0 + text_w + 6, y0 + text_h + 6],
+                fill=(0, 0, 0),
+            )
+            draw.text(
+                (x0 - bbox[0], y0 - bbox[1]), text, font=font, fill=(255, 255, 255)
+            )
+
+    save_format = "JPEG" if output_path.suffix.lower() in {".jpg", ".jpeg"} else "PNG"
+    sheet.save(output_path, format=save_format)
+    if not output_path.is_file():
+        raise RuntimeError("PIL contact sheet was not written")
 
 
 # ============================================================

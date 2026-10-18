@@ -279,6 +279,20 @@ class VLMQATool(BaseTool):
 
             usage = data.get("usage") or {}
             choices = data.get("choices") or []
+            if not choices:
+                # Some servers/proxies return 200 with an empty choices
+                # list (e.g. content filter, overloaded endpoint) — treat
+                # it as a per-scene error instead of crashing on
+                # ``choices[0]``.
+                entry.update(
+                    {
+                        "error": "no choices in VLM response",
+                        "passed": False,
+                        "usage": usage,
+                    }
+                )
+                results.append(entry)
+                continue
             answer = str(((choices[0].get("message") or {}).get("content")) or "")
             parsed = parse_rubric_json(answer)
             if parsed is None:
@@ -305,9 +319,11 @@ class VLMQATool(BaseTool):
             } or scores
             mean = sum(scored.values()) / len(scored) if scored else 0.0
             verdict = str(parsed.get("verdict") or "").lower()
-            passed = (
-                verdict == "pass" if verdict in {"pass", "fail"} else mean >= arguments.pass_threshold
-            )
+            # The rubric prompt tells the model to always emit a verdict, so
+            # a present verdict must never bypass the numeric threshold:
+            # a scene passes only when the mean score clears pass_threshold
+            # AND the verdict is not an explicit "fail".
+            passed = (mean >= arguments.pass_threshold) and (verdict != "fail")
             entry.update(
                 {
                     "frames_reviewed": len(data_uris),

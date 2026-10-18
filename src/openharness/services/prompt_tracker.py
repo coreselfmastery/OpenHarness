@@ -108,16 +108,20 @@ class PromptTracker:
         self, prompt_id: str, *, passed: bool, version: int = 1, scene: str = ""
     ) -> None:
         """Record one use of a prompt (pass or fail at QA)."""
+        pid = prompt_id.strip()
+        now = self._store.now()
+        # Auto-register unseen (prompt_id, version) pairs: stats() joins
+        # FROM prompts, so a result recorded without a prior
+        # register_prompt() call would otherwise be invisible forever.
+        self._store.execute(
+            "INSERT OR IGNORE INTO prompts (prompt_id, version, created_at) "
+            "VALUES (?, ?, ?)",
+            (pid, int(version), now),
+        )
         self._store.execute(
             "INSERT INTO results (prompt_id, version, passed, scene, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (
-                prompt_id.strip(),
-                int(version),
-                1 if passed else 0,
-                scene,
-                self._store.now(),
-            ),
+            (pid, int(version), 1 if passed else 0, scene, now),
         )
 
     # ------------------------------------------------------------------
@@ -166,12 +170,15 @@ class PromptTracker:
         return stats
 
     def best_version(self, prompt_id: str) -> dict[str, Any] | None:
-        """The highest-success version of a prompt with >= 1 use."""
+        """The highest-success NON-RETIRED version of a prompt with >= 1 use."""
         rows = self._store.query(
             """
-            SELECT version, COUNT(*) AS uses, AVG(passed) AS rate
-            FROM results WHERE prompt_id = ?
-            GROUP BY version ORDER BY rate DESC, uses DESC LIMIT 1
+            SELECT r.version, COUNT(*) AS uses, AVG(r.passed) AS rate
+            FROM results r
+            JOIN prompts p
+              ON p.prompt_id = r.prompt_id AND p.version = r.version
+            WHERE r.prompt_id = ? AND p.retired = 0
+            GROUP BY r.version ORDER BY rate DESC, uses DESC LIMIT 1
             """,
             (prompt_id.strip(),),
         )

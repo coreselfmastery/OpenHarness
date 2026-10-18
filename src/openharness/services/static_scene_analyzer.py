@@ -96,8 +96,14 @@ _JS_ASSET_RE = re.compile(r"['\"]([^'\"]+\.(?:png|jpe?g|webp|svg|gif|bmp|mp3|wav
 _JS_FONT_SIZE_RE = re.compile(r"font(?:Size|size)\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)")
 _JS_HEX_COLOR_RE = re.compile(r"['\"]#([0-9a-fA-F]{6})['\"]")
 # x/y/left/top/right/bottom assignments with numeric values (px or bare).
+# NOTE: the negative lookbehind keeps CSS-ish compounds (margin-left,
+# padding-top, scrollLeft, ...) from matching their tail word, and
+# translateX/translateY are deliberately EXCLUDED — they are relative
+# offsets (0 = no translation), not absolute frame positions, so
+# checking them against safe-area bounds flagged every idle
+# ``translateX: 0`` / ``translateY: 0`` as off_safe_area.
 _JS_POSITION_RE = re.compile(
-    r"\b(?:x|y|left|top|right|bottom|translateX|translateY)\s*[:=]\s*"
+    r"(?<![\w$-])(x|y|left|top|right|bottom)\s*[:=]\s*"
     r"(-?\d+(?:\.\d+)?)(?:px|f)?\b"
 )
 
@@ -322,8 +328,8 @@ class StaticSceneAnalyzer:
                         )
                     )
             for match in _JS_POSITION_RE.finditer(line):
-                axis = "x" if re.search(r"\b(?:x|left|right|translateX)\b", match.group(0)) else "y"
-                value = float(match.group(1))
+                axis = "x" if match.group(1) in {"x", "left", "right"} else "y"
+                value = float(match.group(2))
                 lo, hi = safe["x"] if axis == "x" else safe["y"]
                 if not (lo <= value <= hi):
                     report.issues.append(

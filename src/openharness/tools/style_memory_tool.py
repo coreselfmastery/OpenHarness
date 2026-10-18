@@ -31,7 +31,8 @@ class StyleMemoryInput(BaseModel):
         pattern="^(record|suggest|projects|stats)$",
     )
     project: str = Field(
-        description="Project name (record) or filter (suggest/projects)."
+        default="",
+        description="Project name (record) or filter (suggest/projects).",
     )
     style_name: str = Field(
         default="",
