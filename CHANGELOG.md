@@ -6,7 +6,17 @@ The format is based on Keep a Changelog, and this project currently tracks chang
 
 ## [Unreleased]
 
+### Changed
+
+- **The no-timeout doctrine — three premature caps that were the biggest hidden time sink on Kaggle, killed** (the fix behind "make it faster, don't timeout"):
+  - `Settings.timeout` **30 s -> 600 s**: this is the OpenAI-compat SDK request timeout (connect + time-to-first-byte + max gap between streamed chunks). Big-prompt prefills — 100k+ token contexts with STYLE.md/STORYBOARD.md auto-injected — sit silent for 30-90 s before the first byte, so the old default killed legitimate calls mid-flight and the auto-retry storm (4 attempts, each repaying connect + prefill) burned minutes per scene-code call. 600 s matches `llm_call_timeout_seconds` and the Anthropic SDK default.
+  - `OPENHARNESS_TIMEOUT` values below **120 s are clamped with a warning** (`_LLM_TIMEOUT_FLOOR_SECONDS`) — the Kaggle tuning doc's own `=120` advice was the footgun; the doc now recommends 600 and `MAX_TURNS=200` for film runs (50 died mid-pipeline on a 20-min video and looked like a hang).
+  - `COMPACT_TIMEOUT_SECONDS` **25 s -> 300 s** (env: `OPENHARNESS_COMPACT_TIMEOUT_SECONDS`): compaction summarizes a near-full context and can legitimately stream for minutes; 25 s forced the truncation fallback — lost context (creative damage) plus the agent re-reading files to rebuild it (slower).
+  - `control.llm_call_timeout_seconds` was **dead config** (defined, env-mapped, never consumed) — now wired as the floor everywhere the OpenAI-compat client is built (`ui/runtime.py`, 3 sites, via `_llm_request_timeout`).
+  - `tests/test_speed_wave8_no_timeouts.py` (10 tests): defaults, the clamp, the passthrough, the env-tunable compaction cap, the wiring into the client, retry constants unchanged. Full suite green (1695 passed after installing the optional `lark_oapi`/`croniter` deps this fresh environment lacked).
+
 ### Added
+
 
 - **Video QA stack, wave 4 — a four-layer QA funnel plus learning stores** (8 new tools; 67 registered total):
   - **`scene_lint`** (`services.static_scene_analyzer`) — structural analysis of scene code BEFORE rendering: Python scenes parsed with the real `ast` (JS/TS via calibrated regexes); flags undeclared asset references (hard fail — the render would crash), off-safe-area positions, font sizes below the project minimum (scaled by frame height), hardcoded colors outside the brand palette, repeated magic constants (drift risk), and non-deterministic calls (`Math.random()`, `Date.now()`, `random.random()`, `time.time()`, ...) that break re-render determinism. Accepts an assets manifest (JSON list or `{"assets": [...]}`) and the same palette files as `pixel_qa`. Catching errors at the code level is ~100x cheaper than after rendering.
