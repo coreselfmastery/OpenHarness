@@ -184,6 +184,10 @@ form, engines/blender-perf.md "与 OpenHarness 的桥"):
     "page": [
       "bin/vh", "film", "render", "{scene}",
       "--tier", "{tier}", "--out", "{output}"
+    ],
+    "manimgx": [
+      "tools/manimgx_render.sh", "{scene}", "{scene_class}",
+      "-r", "{width}x{height}", "--fps", "{fps}", "-o", "{output}"
     ]
   }
   ```
@@ -194,6 +198,13 @@ form, engines/blender-perf.md "与 OpenHarness 的桥"):
   nvenc p5 cq23, final = the full-size x264 master (the
   byte-determinism contract). Explicit `--res`/`--dpr`/`--encoder`/
   `--crf`/`--preset` in the template override any single part.
+- **ManimGX bridges through `{width}×{height}` + `{fps}`** — the
+  queue's tiering already fills them (draft 640×360, review 1280×720,
+  final 1920×1080), and the wrapper's SHA-256 scene hash (scene code +
+  flags + engine version) is the "skip unchanged scenes between
+  drafts" lever: an unchanged scene is a cache hit costing zero GPU
+  time, a changed one re-renders automatically (engines/manimgx.md;
+  `tools/manimgx_render.sh`).
 - Web films (HyperFrames) are film-level renders with their own
   gates (`bin/vh`); the queue's `hyperframes` template covers
   per-scene render jobs only.
