@@ -115,12 +115,24 @@ export OPENHARNESS_WATCHDOG_TIMEOUT_SECONDS=1350
 export OPENHARNESS_TRUSTED_PATHS=/data/assets:/tmp/output:/var/cache
 ```
 
-### Speed: fewer retries, tighter timeouts
+### Speed: no premature timeouts (the biggest hidden time sink)
 
 ```bash
 export OPENHARNESS_MAX_TOKENS=8192          # Larger output window per turn
-export OPENHARNESS_TIMEOUT=120               # 2 min per API call (Kaggle network is slow)
-export OPENHARNESS_MAX_TURNS=50              # Cap agent turns before giving up
+# LLM request timeout. Default is 600 s — do NOT shrink it to "make things
+# faster": big-prompt prefills (100k+ token context with STYLE.md /
+# STORYBOARD.md injected) sit silent for 30-90 s before the first byte.
+# A 30-120 s cap kills the call mid-flight and the auto-retry storm
+# (4 attempts, each repaying connect + prefill) wastes minutes per scene.
+# Values below 120 s are now clamped with a warning — for good reason.
+export OPENHARNESS_TIMEOUT=600
+# Long-film runs need headroom: 50 turns dies mid-pipeline on a 20-min
+# video (it looks like a hang — nothing progresses, no error).
+export OPENHARNESS_MAX_TURNS=200
+
+# Compaction (context summarization) can stream for minutes on slow
+# providers; the old 25 s cap forced truncation fallbacks.
+export OPENHARNESS_COMPACT_TIMEOUT_SECONDS=300
 ```
 
 ### Speed: auto-compact absolute override
@@ -269,8 +281,9 @@ export OPENHARNESS_AUTO_SAVE_INTERVAL=10
 export OPENHARNESS_THINKING_BUDGET=4096
 export OPENHARNESS_SANDBOX_ENABLED=0
 export OPENHARNESS_MAX_TOKENS=8192
-export OPENHARNESS_TIMEOUT=120
-export OPENHARNESS_MAX_TURNS=50
+export OPENHARNESS_TIMEOUT=600
+export OPENHARNESS_MAX_TURNS=200
+export OPENHARNESS_COMPACT_TIMEOUT_SECONDS=300
 ```
 
 ## 8. What was optimized in the code (summary)

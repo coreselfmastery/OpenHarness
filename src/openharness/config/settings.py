@@ -859,7 +859,14 @@ class Settings(BaseModel):
     model: str = "claude-sonnet-4-6"
     max_tokens: int = 16384
     base_url: str | None = None
-    timeout: float = 30.0
+    # LLM request timeout (seconds), SDK-level: bounds connect +
+    # time-to-first-byte + max gap between streamed chunks. Big-prompt
+    # prefills (100k+ token contexts with style/storyboard injected) sit
+    # SILENT for 30-90 s before the first byte, so the old 30 s default
+    # caused read-timeout retry storms on Kaggle — each retry repaid
+    # connect+prefill, minutes lost per scene-code call. 600 s matches
+    # llm_call_timeout_seconds and the Anthropic SDK default.
+    timeout: float = 600.0
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
     api_format: str = "anthropic"  # "anthropic", "openai", or "copilot"
@@ -1266,6 +1273,13 @@ class _CsvList:
     """Sentinel type marking comma-separated list env overrides."""
 
 
+#: Minimum sane LLM request timeout. Below this, big-prompt prefills
+#: (100k+ context) die mid-flight on Kaggle providers and the automatic
+#: retry storm (MAX_RETRIES=3, each repaying connect + prefill) costs
+#: far more wall-clock than the tight timeout ever saved.
+_LLM_TIMEOUT_FLOOR_SECONDS = 120.0
+
+
 def _apply_env_overrides(settings: Settings) -> Settings:
     """Apply supported environment variable overrides over loaded settings.
 
@@ -1306,7 +1320,19 @@ def _apply_env_overrides(settings: Settings) -> Settings:
 
     timeout = os.environ.get("OPENHARNESS_TIMEOUT")
     if timeout:
-        updates["timeout"] = float(timeout)
+        value = float(timeout)
+        if value < _LLM_TIMEOUT_FLOOR_SECONDS:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "OPENHARNESS_TIMEOUT=%.1fs is below the %.0fs floor — raising it: "
+                "sub-floor values kill big-prefill streams mid-flight and the "
+                "retry storm costs far more time than the cap saves",
+                value,
+                _LLM_TIMEOUT_FLOOR_SECONDS,
+            )
+            value = _LLM_TIMEOUT_FLOOR_SECONDS
+        updates["timeout"] = value
 
     max_turns = os.environ.get("OPENHARNESS_MAX_TURNS")
     if max_turns:

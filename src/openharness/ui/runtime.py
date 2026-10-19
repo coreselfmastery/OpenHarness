@@ -272,13 +272,13 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
                 return OpenAICompatibleClient(
                     api_key=api_key_override,
                     base_url=settings.base_url,
-                    timeout=settings.timeout,
+                    timeout=_llm_request_timeout(settings, settings.timeout),
                 )
             auth = _safe_resolve_auth()
             return OpenAICompatibleClient(
                 api_key=auth.value,
                 base_url=settings.base_url,
-                timeout=settings.timeout,
+                timeout=_llm_request_timeout(settings, settings.timeout),
             )
         if api_key_override is not None:
             return AnthropicApiClient(
@@ -399,6 +399,21 @@ def _wrap_with_inference_pipeline(
         return primary
 
 
+def _llm_request_timeout(settings, timeout: float | None) -> float | None:
+    """Floor the OpenAI-compat request timeout at control.llm_call_timeout_seconds.
+
+    That control setting (default 600 s) is the documented LLM call budget,
+    but before this helper it had no consumer: a stale profile (or the old
+    30 s default) produced mid-call read timeouts on big-prompt prefills
+    — the retry storm was the single biggest hidden time sink on Kaggle.
+    """
+    control = getattr(settings, "control", None)
+    floor = float(getattr(control, "llm_call_timeout_seconds", 0) or 0)
+    if floor and (timeout is None or timeout < floor):
+        return floor
+    return timeout
+
+
 def _build_primary_with_overrides(settings, api_key: str) -> SupportsStreamingMessages:
     """Rebuild the primary client with an explicit API key (#6 pool)."""
     materialized = settings.materialize_active_profile()
@@ -414,7 +429,7 @@ def _build_primary_with_overrides(settings, api_key: str) -> SupportsStreamingMe
         return OpenAICompatibleClient(
             api_key=api_key,
             base_url=materialized.base_url,
-            timeout=materialized.timeout,
+            timeout=_llm_request_timeout(settings, materialized.timeout),
         )
     return AnthropicApiClient(api_key=api_key, base_url=materialized.base_url)
 

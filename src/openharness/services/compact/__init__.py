@@ -55,7 +55,14 @@ TIME_BASED_MC_CLEARED_MESSAGE = "[Old tool result content cleared]"
 AUTOCOMPACT_BUFFER_TOKENS = 13_000
 MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000
 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
-COMPACT_TIMEOUT_SECONDS = 25
+# Compaction summarizes a near-full context and can legitimately stream for
+# minutes (up to MAX_OUTPUT_TOKENS_FOR_SUMMARY tokens of output). The old 25 s
+# cap timed out most real compactions -> hard-truncation fallback (lost
+# context = creative damage) -> the agent re-read files to rebuild context
+# (slower). 300 s default, env-tunable for slow providers.
+COMPACT_TIMEOUT_SECONDS = float(
+    os.environ.get("OPENHARNESS_COMPACT_TIMEOUT_SECONDS", "300")
+)
 MAX_COMPACT_STREAMING_RETRIES = 2
 MAX_PTL_RETRIES = 3
 SESSION_MEMORY_KEEP_RECENT = 12
