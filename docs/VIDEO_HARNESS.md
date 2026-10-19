@@ -170,6 +170,30 @@ form, engines/blender-perf.md "与 OpenHarness 的桥"):
 - Long single sequences that want BOTH cards at once do not go
   through the queue: OpenVideoHarness's `tools/blender_split.sh`
   splits the frame range across the GPUs (one process per card).
+- **The page-contract engines (canvas-film, ClaudeAnimationBase /
+  p5.brush, any `window.film` page) bridge with `--tier`** — the same
+  one-word policy on `tools/film/render.mjs` (run it as `bin/vh film
+  render`, which finds the browser itself):
+
+  ```json
+  {
+    "blender": [
+      "tools/blender_run.sh", "--profile", "{tier}", "--",
+      "blender", "-b", "{scene}", "-o", "{output_stem}", "-a"
+    ],
+    "page": [
+      "bin/vh", "film", "render", "{scene}",
+      "--tier", "{tier}", "--out", "{output}"
+    ]
+  }
+  ```
+
+  `--tier` maps the queue's tiers onto the whole quality policy:
+  draft = 480p + h264_nvenc p4 cq28 when a card answers (and the
+  chunk encoders spread round-robin over BOTH T4s), review = 720p +
+  nvenc p5 cq23, final = the full-size x264 master (the
+  byte-determinism contract). Explicit `--res`/`--dpr`/`--encoder`/
+  `--crf`/`--preset` in the template override any single part.
 - Web films (HyperFrames) are film-level renders with their own
   gates (`bin/vh`); the queue's `hyperframes` template covers
   per-scene render jobs only.
