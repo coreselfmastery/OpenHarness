@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +135,10 @@ class RenderScenesTool(BaseTool):
         output_dir = (
             (context.cwd / arguments.output_dir) if arguments.output_dir else None
         )
+        # "since" scopes the wait + summary to THIS call's jobs: an older
+        # background batch on the same scenes must never be counted here
+        # (and must never delay the wait — that was the wait_all() bug).
+        since = time.monotonic()
         jobs = pipeline.submit_batch(
             scene_paths,
             engine=arguments.engine,
@@ -143,24 +148,38 @@ class RenderScenesTool(BaseTool):
         )
 
         if arguments.mode == "background":
+            wave_count = len(jobs)
+            chained = len(scene_paths) - wave_count
             lines = [
                 f"[render_scenes] {len(scene_paths)} scene(s) submitted in background.",
                 f"Workers: {pipeline.workers}; tier: {arguments.tier}; engine: {arguments.engine}.",
-                "Track with render_queue_status. Job ids: "
-                + ", ".join(j.job_id for j in jobs),
             ]
+            if chained > 0:
+                lines.append(
+                    f"{wave_count} submitted now; {chained} dependency-chained scene(s) "
+                    "submit automatically as earlier waves finish."
+                )
+            lines.append(
+                "Track with render_queue_status. First-wave job ids: "
+                + ", ".join(j.job_id for j in jobs)
+            )
             return ToolResult(output="\n".join(lines), metadata={"job_ids": [j.job_id for j in jobs]})
 
-        await pipeline.wait_all()
-        # Summarize ONLY this call's jobs (``submit_batch`` already
-        # returned the full job set, dependency waves included) — the
-        # process-wide ``jobs_snapshot()`` contains every job ever
-        # submitted, so a wait-mode report after an earlier background
-        # batch would count foreign jobs and re-mark foreign scenes.
-        jobs_sorted = sorted(jobs or [], key=lambda j: j.job_id)
+        # Wait for THIS call's scenes only — dependency waves included,
+        # foreign background batches excluded (wait_all() blocked on
+        # every job ever submitted, so one stray background render
+        # froze the wait for unrelated scenes).
+        by_scene = await pipeline.wait_for_scenes(
+            scene_paths, tier=arguments.tier, since=since
+        )
+        # Submit-side view: every submitted scene has a job EXCEPT any
+        # the dependency chain never reached (aborted chain / drained).
+        jobs_sorted = sorted(by_scene.values(), key=lambda j: j.scene.name)
         lines = [f"[render_scenes] {len(scene_paths)} scene(s), tier={arguments.tier}, engine={arguments.engine}"]
         passed = failed = cached = 0
+        seen_stems: set[str] = set()
         for job in jobs_sorted:
+            seen_stems.add(job.scene.stem)
             if job.status == "done":
                 passed += 1
                 tracker.mark(job.scene.stem, "rendered", tier=job.tier)
@@ -178,6 +197,14 @@ class RenderScenesTool(BaseTool):
                 failed += 1
                 tracker.mark(job.scene.stem, "failed", detail=job.error[:120])
                 lines.append(f"  FAIL {job.scene.name}: {job.error[:200]}")
+        # Scenes the chain never submitted (dead dependency chain):
+        # report them honestly instead of silently vanishing from the
+        # summary — the caller needs to know they were NOT rendered.
+        for scene in scene_paths:
+            if scene.stem not in seen_stems:
+                failed += 1
+                tracker.mark(scene.stem, "failed", detail="never submitted (dependency chain aborted)")
+                lines.append(f"  MISS {scene.name}: never submitted (dependency chain aborted)")
         codec = pipeline.status().get("codec", "?")
         lines.append(
             f"Summary: {passed} rendered, {cached} cache-skipped, {failed} failed. Codec: {codec}."

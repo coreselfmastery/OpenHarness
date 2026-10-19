@@ -419,15 +419,29 @@ def test_configure_control_bus_from_settings():
     from openharness.services.control_bus import configure_control_bus_from_settings
 
     assert configure_control_bus_from_settings(Settings(control=ControlSettings(enabled=False))) is None
+    # Explicit watchdog above the 1.5x-tool-timeout floor passes through.
     bus = configure_control_bus_from_settings(
         Settings(
             control=ControlSettings(
-                enabled=True, watchdog_timeout_seconds=42, deadlock_probe_seconds=7
+                enabled=True, watchdog_timeout_seconds=4200, deadlock_probe_seconds=7
             )
         )
     )
     assert bus is not None
-    assert bus.status()["watchdog_timeout_seconds"] == 42
+    assert bus.status()["watchdog_timeout_seconds"] == 4200
+
+    # A watchdog below 1.5 x tool_timeout is clamped up (wave-7 G2 fix:
+    # a tool that legitimately uses its full timeout is not a hung
+    # session — the old 42s watchdog would have killed it mid-tool).
+    clamped = configure_control_bus_from_settings(
+        Settings(
+            control=ControlSettings(
+                enabled=True, watchdog_timeout_seconds=42,
+                tool_timeout_seconds=100, deadlock_probe_seconds=7,
+            )
+        )
+    )
+    assert clamped.status()["watchdog_timeout_seconds"] == 150
 
 
 # ======================================================================

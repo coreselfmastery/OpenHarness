@@ -4,8 +4,10 @@ One process-wide object that the query loop, tools and background
 workers all share:
 
 - #26 Kill switch: ``trip()`` arms an ``asyncio.Event``; the query loop
-  (and render pipeline, via ``install_watchee``) observe it and abort
-  promptly with ``KillSwitchTripped``.
+  observes it and aborts promptly with ``KillSwitchTripped``. Registered
+  watchees (``install_watchee``) — e.g. the render pipeline — get their
+  ``abort`` callback invoked so their SUBPROCESSES die with the session
+  instead of running on to their own timeouts.
 - #30 Pause / resume: ``pause()`` closes an async gate; the query loop
   awaits it between turns; ``resume()`` reopens it. ``inject_message``
   queues a user message that the loop appends at the next turn
@@ -108,10 +110,49 @@ class ControlBus:
         self._deadlock_probes: list[Callable[[], dict[str, Any]]] = []
         # Cleanup hooks executed during graceful shutdown (#32).
         self._shutdown_hooks: list[Callable[[], Awaitable[None]]] = []
+        # Watchees (#26): subsystems that own OS subprocesses (the render
+        # pipeline). On trip(), each abort callback is invoked (sync or
+        # async, 10s budget) so a killed session does not leave renders
+        # running to their own multi-hour timeouts on the GPUs.
+        self._watchees: list[tuple[str, Callable[[str], Any]]] = []
 
     # ------------------------------------------------------------------
     # #26 — kill switch
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # #26 — watchees: abort owned subprocesses on kill
+    # ------------------------------------------------------------------
+
+    def install_watchee(self, name: str, abort: Callable[[str], Any]) -> None:
+        """Register a subprocess owner whose ``abort(reason)`` is invoked
+        when the kill switch trips.
+
+        ``abort`` may be sync or async and receives the kill reason. It
+        must terminate the owned subprocesses promptly (the caller wraps
+        it in a 10-second budget and never lets an exception escape into
+        the kill path). Registering the same (name, abort) twice is a
+        no-op, so subsystems can re-register on every configuration
+        refresh without growing the list.
+        """
+        entry = (str(name), abort)
+        if entry not in self._watchees:
+            self._watchees.append(entry)
+
+    def watchees(self) -> list[str]:
+        """Names of the registered watchees (for status displays)."""
+        return [name for name, _abort in self._watchees]
+
+    async def _abort_watchees(self, reason: str) -> None:
+        for name, abort in list(self._watchees):
+            try:
+                outcome = abort(reason)
+                if asyncio.iscoroutine(outcome) or asyncio.isfuture(outcome):
+                    await asyncio.wait_for(outcome, timeout=10.0)
+            except Exception as exc:  # noqa: BLE001 - kill must always proceed
+                log.warning("watchee %s abort failed: %s", name, exc)
+            else:
+                log.info("watchee %s aborted (kill)", name)
 
     def trip(self, reason: str = "manual kill") -> None:
         """Trip the kill switch. Idempotent; first reason wins."""
@@ -123,6 +164,15 @@ class ControlBus:
         self.state.kill_reason = reason
         get_audit_log().record_control("kill", {"reason": reason}, )
         log.warning("KILL SWITCH TRIPPED: %s", reason)
+        # Fire-and-forget: trip() is sync (called from tool paths and
+        # signal handlers) and must never block the caller on a stuck
+        # subprocess. The abort task is bounded (10s per watchee).
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop in this thread (sync caller) — watchees
+            # will see the kill event on their next observation instead
+        loop.create_task(self._abort_watchees(reason))
 
     @property
     def killed(self) -> bool:

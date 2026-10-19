@@ -60,7 +60,7 @@ class BaseTool(ABC):
         The schema is computed once and cached on the instance, because the
         tool registry calls this on every API turn and the underlying
         ``model_json_schema()`` call is the dominant cost (~9 ms for the
-        default 44-tool registry, with spikes to >1 s when Pydantic's ref
+        default 67-tool registry, with spikes to >1 s when Pydantic's ref
         cache is cold).
         """
         cached = self._cached_api_schema
@@ -82,7 +82,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
         # Cache of the full schema list. Invalidated whenever the registry
-        # mutates. Building the schema list for 44 tools costs ~10 ms median
+        # mutates. Building the schema list for 67 tools costs ~10 ms median
         # (with 1.8 s p99 spikes when Pydantic's ref-cache is cold), and the
         # query loop calls this on every API turn.
         self._cached_schema_list: list[dict[str, Any]] | None = None

@@ -4,8 +4,9 @@ Caches the output of read-only tool calls so the same ``read_file``,
 ``grep``, or ``glob`` invocation never runs twice within a session.
 
 The cache is keyed by ``(tool_name, canonical_input)`` and invalidated
-on any mutating tool call (``write_file``, ``edit_file``, ``notebook_edit``,
-``bash`` with non-zero return code, or any tool marked non-read-only).
+on any mutating tool call (``write_file``, ``edit_file``,
+``notebook_edit``, a bash command that does not match the
+obviously-read-only allowlist, or any tool marked non-read-only).
 
 This implements optimization #7 from the top-10 list:
 "Don't re-run identical tools. Cache results for a set time."
@@ -40,16 +41,176 @@ _CACHEABLE_TOOLS: frozenset[str] = frozenset({
 # Tools that mutate state and therefore invalidate the cache when called.
 # We invalidate the *entire* cache because the mutation could affect any
 # cached path (e.g. ``write_file("a.py", ...)`` invalidates ``grep`` results
-# that include ``a.py``). ``bash`` invalidates on *every* call, successful
-# or not — a successful ``rm``/``mv`` mutates just as much as a failing one,
-# so returncode-based filtering would be unsound.
+# that include ``a.py``). ``bash`` used to invalidate on *every* call,
+# which collapsed hit rates in mutating sessions even when the model was
+# just running ``ls``/``git status`` between edits — read-only bash calls
+# are now recognized by ``_bash_command_mutates`` (conservative: anything
+# not clearly read-only still invalidates).
 _MUTATING_TOOLS: frozenset[str] = frozenset({
     "write_file",
     "edit_file",
     "notebook_edit",
-    "bash",
     "todo_write",
 })
+
+# Bash first-words that cannot change filesystem state (no redirection,
+# no subcommand that writes). ``git`` is special-cased by subcommand.
+_BASH_READ_ONLY_WORDS: frozenset[str] = frozenset({
+    "ls", "cat", "head", "tail", "pwd", "echo", "printf", "which",
+    "whereis", "rg", "grep", "fd", "find", "wc", "stat", "file", "du",
+    "df", "ps", "env", "printenv", "date", "uname", "whoami", "id",
+    "hostname", "true", "false", "test", "[", "nproc", "free", "lscpu",
+    "nvidia-smi", "python", "python3", "node", "npm", "pip", "cargo",
+    "git", "diff", "cmp", "md5sum", "sha256sum", "tree", "w", "top",
+    "uptime", "groups", "getconf", "type", "command", "help", "cd",
+})
+
+# ``git <subcommand>`` pairs that are read-only. Subcommands in the
+# first set never mutate; the second set (branch/tag/remote) lists when
+# invoked bare but CREATES when given a name argument, so they count as
+# read-only only with no extra non-flag argument.
+_GIT_ALWAYS_READ_ONLY: frozenset[str] = frozenset({
+    "status", "log", "diff", "show", "rev-parse", "blame",
+    "shortlog", "describe", "ls-files", "ls-remote", "reflog",
+    "name-rev", "annotate", "cat-file", "count-objects",
+    "verify-commit", "verify-tag",
+})
+_GIT_LIST_ONLY_SUBS: frozenset[str] = frozenset({"branch", "tag", "remote", "worktree"})
+
+# ``npm/pip/cargo/python <subcommand>`` pairs that are read-only-ish:
+# pip list/show, npm ls, cargo --version, python --version. Anything
+# else under these interpreters is assumed mutating (``python -c`` can
+# write files, ``pip install`` mutates the environment).
+_INTERPRETER_READ_ONLY_SUBS: dict[str, frozenset[str]] = {
+    "pip": frozenset({"list", "show", "freeze", "index"}),
+    "npm": frozenset({"ls", "list", "outdated", "view", "search", "config"}),
+    "cargo": frozenset({"--version", "search"}),
+    "python": frozenset({"--version", "-V", "-m", "pip"}),
+    "python3": frozenset({"--version", "-V", "-m", "pip"}),
+    "node": frozenset({"--version", "-v"}),
+}
+
+# Mutating markers anywhere in the command line. NOTE: plain substring
+# matches — over-matching is SAFE here (it only costs a cache miss).
+_BASH_MUTATING_MARKERS: tuple[str, ...] = (
+    ">", ">>", "tee", "xargs", "truncate", "shred", "touch", "mkdir",
+    "rmdir", "chmod", "chown", "ln -s", "sed -i", "perl -i",
+    "gawk -i", "install -m", "sync", "mkfs", "dd ", "-delete",
+    "-exec", "-ok", "-fprint", "unlink", "rsync", "git push",
+    "git pull", "git commit", "git merge", "git rebase",
+    "git checkout", "git reset", "git clean", "git apply", "git am",
+    "git add", "git stash", "git worktree add", "git worktree remove",
+    "git switch", "git restore", "pip install", "pip uninstall",
+    "pip download", "npm install", "npm ci", "npm publish", "npm update",
+    "npm uninstall", "cargo build", "cargo install", "cargo run",
+    "make ", "cmake ", "tar ", "unzip", "gzip", "gunzip", "7z",
+    "curl -o", "curl -O", "wget ", "scp ", "ssh ", "kill ", "pkill",
+    "reboot", "shutdown", "apt ", "apt-get ", "yum ", "brew ",
+)
+
+
+def _split_shell_segments(command: str) -> list[str]:
+    """Split a shell command on && ; | separators (quote-aware-lite)."""
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    for ch in command:
+        if quote:
+            if ch == quote:
+                quote = None
+            current.append(ch)
+            continue
+        if ch in "'\"":
+            quote = ch
+            current.append(ch)
+            continue
+        if ch in "&;|":
+            if ch == "&" and current and current[-1] == "&":
+                current.pop()
+                segments.append("".join(current).strip())
+                current = []
+            elif ch in ";|":
+                segments.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+            continue
+        current.append(ch)
+    segments.append("".join(current).strip())
+    return [s for s in segments if s]
+
+
+def _segment_is_read_only(segment: str) -> bool:
+    """One shell segment is read-only (conservatively judged)."""
+    import re
+    import shlex
+
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False  # unparseable — assume mutating
+    # Strip leading VAR=value assignments (FOO=bar ls ...).
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens = tokens[1:]
+    if not tokens:
+        return True  # pure assignment is not a cache-relevant mutation
+    head = tokens[0]
+    # bare command name or a path to it ("./scripts/x.sh" → "x")
+    base = head.rsplit("/", 1)[-1]
+    if base == "sudo":
+        tokens = tokens[1:]
+        if not tokens:
+            return False
+        base = tokens[0].rsplit("/", 1)[-1]
+    if base not in _BASH_READ_ONLY_WORDS:
+        # Unknown command — assume mutating. rm/mv/cp/dd and friends all
+        # land here: they are simply not in the read-only word list.
+        return False
+    if base == "git":
+        rest = [t for t in tokens[1:]]
+        sub = next((t for t in rest if not t.startswith("-")), "")
+        if sub == "":
+            # bare git / flags-only git (``git tag -l``) prints — safe
+            return True
+        if sub in _GIT_ALWAYS_READ_ONLY:
+            return True
+        if sub in _GIT_LIST_ONLY_SUBS:
+            # bare ``git branch`` / ``git tag -l`` lists;
+            # ``git branch feature`` / ``git tag v1`` creates.
+            positional = [t for t in rest[1:] if not t.startswith("-")]
+            return len(positional) == 0
+        return False
+    if base in _INTERPRETER_READ_ONLY_SUBS:
+        sub = tokens[1] if len(tokens) > 1 else "--version"
+        allowed = _INTERPRETER_READ_ONLY_SUBS[base]
+        if sub in allowed:
+            return True
+        if base.startswith("python") and sub == "-m":
+            mod = tokens[2] if len(tokens) > 2 else ""
+            return mod == "pip"  # python -m pip → judge like pip
+        return False
+    # find with -delete/-exec is mutating — excluded via markers below.
+    return True
+
+
+def _bash_command_mutates(command: str) -> bool:
+    """Conservative: True unless the WHOLE command line is obviously read-only.
+
+    Any redirection, any mutating marker anywhere, any unknown command
+    → invalidate (the safe default). A plain ``ls`` between two edits
+    no longer wipes the cache.
+    """
+    if not command or not command.strip():
+        return False
+    if any(marker in command for marker in _BASH_MUTATING_MARKERS):
+        return True
+    try:
+        segments = _split_shell_segments(command)
+    except Exception:  # noqa: BLE001 - parser must never raise
+        return True
+    if not segments:
+        return False
+    return not all(_segment_is_read_only(seg) for seg in segments)
 
 
 class ToolResultCache:
@@ -84,8 +245,19 @@ class ToolResultCache:
         return tool_name in _CACHEABLE_TOOLS
 
     @staticmethod
-    def is_mutating(tool_name: str) -> bool:
-        """Return True if ``tool_name`` mutates filesystem state."""
+    def is_mutating(tool_name: str, tool_input: dict[str, Any] | None = None) -> bool:
+        """Return True if this call mutates filesystem state.
+
+        For ``bash`` the decision is per-COMMAND via
+        :func:`_bash_command_mutates` (read-only commands like ``ls`` or
+        ``git status`` no longer wipe the whole cache); every other
+        mutating tool still invalidates unconditionally.
+        """
+        if tool_name == "bash":
+            command = str((tool_input or {}).get("command") or "")
+            if not command.strip():
+                return True  # no command visible — assume the worst
+            return _bash_command_mutates(command)
         return tool_name in _MUTATING_TOOLS
 
     @staticmethod

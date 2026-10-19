@@ -49,6 +49,12 @@ See `docs/PERFORMANCE_TUNING_KAGGLE.md` for the full env-var list.
 | `auto_context_inject` | bool | True | When True, spawned agents get STYLE.md / STORYBOARD.md / BRIEF.md prepended to their prompt. |
 | `auto_context_files` | list[str] | [BRIEF.md, STORYBOARD.md, STYLE.md] | List of project context files to auto-inject. |
 | `provider_routing` | dict \| None | None | Multi-provider routing config with primary + fallbacks. When set, the runtime builds a RoutedStreamingClient that retries on retryable errors. |
+| `qa.parallel_waves` | bool | True | Review multiple scenes per QA round. Env: `OPENHARNESS_QA_PARALLEL`. |
+| `qa.wave_size` | int | 5 | Scenes per parallel QA wave. Env: `OPENHARNESS_QA_WAVE_SIZE`. |
+| `qa.review_batching` | bool | True | Batch several scenes into ONE QA LLM call (~10x fewer calls). Env: `OPENHARNESS_QA_BATCHING`. |
+| `qa.model` / `qa.api_key` / `qa.base_url` | str | "" | Dedicated QA reviewer endpoint; falls back to the scene-gen config when empty. Env: `OPENHARNESS_QA_MODEL` / `OPENHARNESS_QA_API_KEY` / `OPENHARNESS_QA_BASE_URL`. |
+| `rendering.render_timeout_seconds` | int | 7200 | Per-render-job hard timeout (Blender hero shots legitimately run 1-2h on a T4). Env: `OPENHARNESS_RENDER_TIMEOUT_SECONDS`. |
+| `control.watchdog_timeout_seconds` | int | 1350 | No-progress kill switch window; auto-raised to >= 1.5x the tool timeout. Running renders feed the watchdog. Env: `OPENHARNESS_WATCHDOG_TIMEOUT_SECONDS`. |
 
 ### New CLI flags
 

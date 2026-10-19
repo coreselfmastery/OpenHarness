@@ -69,6 +69,11 @@ class AsyncAudioGenerator:
     - ``api_key``: bearer token.
     - ``model``: e.g. ``tts-1`` / ``tts-1-hd`` / a server-side alias.
     - ``voice``: default voice id (``alloy``, ...).
+
+    In-flight dedupe: identical (text, voice, speed) requests share one
+    HTTP call — the second caller awaits the first task instead of
+    paying for the same audio twice (scene batches often repeat a
+    line, e.g. a shared sign-off or sponsor read).
     """
 
     def __init__(
@@ -91,6 +96,10 @@ class AsyncAudioGenerator:
         self._format = audio_format
         self._tasks: dict[str, AudioTask] = {}
         self._seq = 0
+        # In-flight dedupe: (text, voice, speed) -> task_id. Cleared in
+        # the finally-block so a completed line can be re-generated later
+        # (e.g. after the output file was deleted).
+        self._in_flight: dict[tuple[str, str, float], str] = {}
 
     async def generate(
         self,
@@ -113,9 +122,38 @@ class AsyncAudioGenerator:
         voice: str | None = None,
         speed: float = 1.0,
     ) -> AudioTask:
-        """Kick off generation without blocking (#22). Returns immediately."""
-        task = self._new_task(text, output_path, voice or self._default_voice)
-        asyncio.create_task(self._run(task, text, voice or self._default_voice, speed))
+        """Kick off generation without blocking (#22). Returns immediately.
+
+        A pending/running request with the SAME (text, voice, speed)
+        returns the existing task — one HTTP call, one bill — instead of
+        starting a duplicate.
+        """
+        effective_voice = voice or self._default_voice
+        # Cross-restart dedupe: with stable (line, voice) filenames, an
+        # existing non-empty output IS the audio — skip the paid API call.
+        try:
+            if output_path.is_file() and output_path.stat().st_size > 0:
+                reused = AudioTask(
+                    task_id=f"audio-reuse-{output_path.stem}",
+                    text=text,
+                    voice=effective_voice,
+                    output_path=Path(output_path),
+                    status="done",
+                )
+                reused.finished_at = time.monotonic()
+                self._tasks[reused.task_id] = reused
+                return reused
+        except OSError:
+            pass  # stat race — fall through to a real call
+        key = (text, effective_voice, float(speed))
+        existing_id = self._in_flight.get(key)
+        if existing_id is not None:
+            existing = self._tasks.get(existing_id)
+            if existing is not None and existing.status in {"pending", "running"}:
+                return existing
+        task = self._new_task(text, output_path, effective_voice)
+        self._in_flight[key] = task.task_id
+        asyncio.create_task(self._run(task, text, effective_voice, speed))
         return task
 
     def _new_task(self, text: str, output_path: Path, voice: str) -> AudioTask:
@@ -157,6 +195,11 @@ class AsyncAudioGenerator:
             log.warning("audio task %s failed: %s", task.task_id, task.error)
         finally:
             task.finished_at = time.monotonic()
+            # Release the dedupe slot so a RE-request of the same line
+            # after completion is a fresh (real) call if asked for again.
+            for key, task_id in list(self._in_flight.items()):
+                if task_id == task.task_id:
+                    del self._in_flight[key]
 
     def status(self, task_id: str | None = None) -> dict[str, Any]:
         if task_id is not None:
@@ -240,7 +283,16 @@ class AssetPrefetcher:
             # 2. Queue voiceover audio in the background.
             if self._audio is not None:
                 for line in _extract_reads(code):
-                    out = (audio_output_dir or cwd / "audio") / f"{Path(scene).stem}_{abs(hash(line)) % 10_000:04d}.mp3"
+                    # STABLE filename: SHA-256 of (line, voice) — the old
+                    # salted ``hash(line)`` changed every restart, so the
+                    # same line was re-bought from the TTS API each
+                    # session and cross-restart dedupe was impossible.
+                    out = _voiceover_path(
+                        audio_output_dir or cwd / "audio",
+                        Path(scene).stem,
+                        line,
+                        self._audio._default_voice,
+                    )
                     self._audio.run_in_background(line, out)
                     report.audio_generated.append(str(out))
         return report
@@ -288,6 +340,15 @@ class AssetPrefetcher:
 
 
 _READS_RE = None
+
+
+def _voiceover_path(audio_dir: Path, scene_stem: str, line: str, voice: str) -> Path:
+    """Deterministic TTS output path — same line + voice, same file,
+    across restarts and processes (stable SHA-256, not salted hash)."""
+    from openharness.services.persistent_store import fingerprint
+
+    digest = fingerprint(line, voice or "default")[:16]
+    return audio_dir / f"{scene_stem}_{digest}.mp3"
 
 
 def _extract_reads(scene_code: str) -> list[str]:

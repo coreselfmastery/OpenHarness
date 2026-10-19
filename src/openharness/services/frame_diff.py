@@ -395,7 +395,7 @@ class FrameDiffAnalyzer:
             # --- intended-motion speed check ---------------------------
             if expected_flow_px_s is not None:
                 low, high = expected_flow_px_s
-                # Observed speed uses the p90 (object-region) flow, the
+                # Observed speed uses the p99 (object-region) flow, the
                 # MEDIAN across pairs (robust to one bad pair), and is
                 # converted to SOURCE-scale pixels: the analysis grid is
                 # 480-px wide, so raw flow magnitudes are in ANALYSIS
@@ -419,7 +419,7 @@ class FrameDiffAnalyzer:
                             timestamp_s=report.duration_s,
                             message=(
                                 f"observed object-region motion {observed:.1f} px/s "
-                                f"(source scale, p90 flow) below expected minimum "
+                                f"(source scale, p99 flow) below expected minimum "
                                 f"{low:.1f} px/s - intended "
                                 "animation may be missing"
                             ),
@@ -434,7 +434,7 @@ class FrameDiffAnalyzer:
                             timestamp_s=report.duration_s,
                             message=(
                                 f"observed object-region motion {observed:.1f} px/s "
-                                f"(source scale, p90 flow) above expected maximum "
+                                f"(source scale, p99 flow) above expected maximum "
                                 f"{high:.1f} px/s - animation "
                                 "faster than designed"
                             ),

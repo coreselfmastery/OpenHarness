@@ -1,7 +1,8 @@
 """Scene-level render cache — items #14 and #17.
 
 Caches render outputs keyed by a *structural fingerprint* of everything
-that determines the output:
+that determines the output — now including the engine binary's
+(path, mtime, size), so upgrading the renderer invalidates stale hits:
 
     SHA-256( scene code
            + referenced asset contents
@@ -110,8 +111,45 @@ def scene_fingerprint(
             "engine_args": list(engine_args),
             "tier": tier,
             "codec": codec,
+            # Engine VERSION (when detectable): binary path + mtime +
+            # size. Upgrading blender/manim/hyperframes used to serve
+            # stale cache hits from the OLD binary — same inputs, but a
+            # different renderer version can produce different output.
+            "engine_binary": _engine_binary_stamp(engine),
         }
     )
+
+
+_ENGINE_BINARY_STAMPS: dict[str, tuple[str, float, int] | None] = {}
+
+
+def _engine_binary_stamp(engine: str) -> tuple[str, float, int] | None:
+    """(path, mtime, size) of the engine binary — None when not found.
+
+    Cached per engine name: the stat is only re-read when the cached
+    mtime/size mismatches, so fingerprinting a batch of scenes costs
+    one stat per engine, not per scene.
+    """
+    import shutil
+
+    cached = _ENGINE_BINARY_STAMPS.get(engine)
+    if cached is not None:
+        try:
+            stat = Path(cached[0]).stat()
+            if stat.st_mtime == cached[1] and stat.st_size == cached[2]:
+                return cached
+        except OSError:
+            pass  # binary moved — re-resolve below
+    binary = shutil.which(engine)
+    if binary is None:
+        return None
+    try:
+        stat = Path(binary).stat()
+        stamp = (binary, stat.st_mtime, stat.st_size)
+    except OSError:
+        return None
+    _ENGINE_BINARY_STAMPS[engine] = stamp
+    return stamp
 
 
 class RenderCache:

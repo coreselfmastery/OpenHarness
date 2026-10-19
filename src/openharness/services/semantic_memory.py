@@ -269,13 +269,23 @@ class SemanticMemory:
         if not query:
             return []
         vector, _backend = self._embed([query])
-        rows = self._store.query(
-            "SELECT * FROM memories ORDER BY created_at DESC LIMIT 5000"
-        )
+        # Project filter INSIDE the SQL: the old post-LIMIT filter let a
+        # chatty project fill the whole 5000-row window and starve every
+        # other project's recall to zero.
+        if project is not None:
+            rows = self._store.query(
+                "SELECT * FROM memories WHERE project = ? "
+                "ORDER BY created_at DESC LIMIT 5000",
+                (project,),
+            )
+        else:
+            rows = self._store.query(
+                "SELECT * FROM memories ORDER BY created_at DESC LIMIT 5000"
+            )
         scored: list[RecalledMemory] = []
         for row in rows:
             if project is not None and row["project"] != project:
-                continue
+                continue  # defensive double-check (no-op on the SQL path)
             if int(row["dims"]) != len(vector[0]):
                 continue  # different embedding space — not comparable
             similarity = _cosine(vector[0], _unpack(row["embedding"]))

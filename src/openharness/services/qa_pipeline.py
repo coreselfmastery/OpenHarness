@@ -120,6 +120,12 @@ FAILURE_CATEGORIES: tuple[str, ...] = (
     "missing_asset",       # referenced file does not exist
     "audio_desync",        # voiceover longer/shorter than scene
     "resolution_mismatch", # hardcoded size != tier size
+    # Catch-alls that ARE recorded by the pipeline (LLM review errors
+    # surface as ``qa_error``; issue-less failures as ``general``) —
+    # previously recorded but never surfaced by ``predict()`` (dead
+    # counters; a failing verdict with zero issues taught nothing).
+    "qa_error",            # the QA call itself failed (retry-able)
+    "general",             # failure with no specific category
 )
 
 # Known, mechanically-checkable signals per category — used to
@@ -607,6 +613,16 @@ class QAReviewer:
                 if verdict.passed:
                     self._predictor.record_success(
                         complexity=complexity.level, engine=engine
+                    )
+                elif not verdict.issues:
+                    # A FAILING verdict with zero issues used to record
+                    # nothing — the failure was invisible to the predictor
+                    # forever. Record it under the catch-all so the rate
+                    # statistics see it.
+                    self._predictor.record_failure(
+                        category="general",
+                        complexity=complexity.level,
+                        engine=engine,
                     )
         log.info(
             "QA: %d scenes reviewed in %.1fs (%d LLM calls)",

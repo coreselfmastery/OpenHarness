@@ -624,6 +624,7 @@ def test_fix7_compressor_never_mutates_input():
 def test_audit_minhash_signature_is_process_salt_independent():
     """Signatures are persisted in SQLite and compared across processes;
     they must not depend on PYTHONHASHSEED."""
+    import os
     import subprocess
     import sys
 
@@ -631,14 +632,22 @@ def test_audit_minhash_signature_is_process_salt_independent():
         "from openharness.services.llm_pipeline import _minhash_signature;"
         "print(_minhash_signature('alpha beta gamma delta epsilon zeta eta theta'))"
     )
+    # The subprocess env must let the package import REGARDLESS of how the
+    # repo is installed (editable site-packages needs HOME for user-site
+    # resolution; src-layout needs the src dir on PYTHONPATH — the old
+    # ``PYTHONPATH='.'`` pointed at the repo root, which has no package).
+    repo_src = str(Path(__file__).resolve().parents[1] / "src")
+    base_env = {"PYTHONPATH": repo_src, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    if "HOME" in os.environ:  # needed for user-site (pip install --user)
+        base_env["HOME"] = os.environ["HOME"]
     out_a = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True,
-        env={"PYTHONPATH": ".", "PYTHONHASHSEED": "1", "PATH": "/usr/bin:/bin"},
+        env={**base_env, "PYTHONHASHSEED": "1"},
         check=True,
     ).stdout.strip()
     out_b = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True,
-        env={"PYTHONPATH": ".", "PYTHONHASHSEED": "12345", "PATH": "/usr/bin:/bin"},
+        env={**base_env, "PYTHONHASHSEED": "12345"},
         check=True,
     ).stdout.strip()
     assert out_a == out_b
@@ -761,14 +770,27 @@ def test_audit_render_status_codec_never_crashes():
 
 
 def test_audit_render_worker_env_gpu_round_robin(monkeypatch):
+    import time as _time
+
     from openharness.services import render_pipeline as rp
 
-    monkeypatch.setattr(rp, "_GPU_COUNT_CACHE", 2)
+    # (count, probed_at) tuple with a FRESH timestamp so the 60s TTL
+    # keeps it valid for the duration of the test.
+    monkeypatch.setattr(rp, "_GPU_COUNT_CACHE", (2, _time.monotonic()))
     envs = [rp._worker_env(i, 4) for i in range(4)]
     assert [e["CUDA_VISIBLE_DEVICES"] for e in envs] == ["0", "1", "0", "1"]
     # CPU-only hosts must not pin non-existent devices.
-    monkeypatch.setattr(rp, "_GPU_COUNT_CACHE", 0)
+    monkeypatch.setattr(rp, "_GPU_COUNT_CACHE", (0, _time.monotonic()))
     assert "CUDA_VISIBLE_DEVICES" not in rp._worker_env(0, 2)
+    # A STALE cache entry (older than the TTL) re-probes and survives
+    # a failed probe (returns 0, not a crash).
+    monkeypatch.setattr(rp, "_GPU_COUNT_CACHE", (2, _time.monotonic() - 61.0))
+    monkeypatch.setattr(
+        "openharness.services.kaggle_env.detect_kaggle_resources",
+        lambda: {},
+        raising=False,
+    )
+    assert rp._visible_gpu_count() == 0
 
 
 def test_audit_render_jobs_for_scene_matches_by_path(tmp_path: Path):

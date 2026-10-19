@@ -283,7 +283,10 @@ class PixelQA:
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     break
-                if index % round(step) == 0 or step < 1.0:
+                # step >= 1.0 by construction (max(1.0, ...)), so a plain
+                # modulo is enough — the old ``or step < 1.0`` arm was
+                # unreachable dead code.
+                if index % round(step) == 0:
                     self._inspect_frame(
                         frame,
                         index=index,

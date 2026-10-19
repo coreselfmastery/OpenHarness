@@ -771,6 +771,10 @@ async def run_query(
         # -----------------------------------------------------------------------------
 
         final_message: ConversationMessage | None = None
+        # Wall-clock of THIS LLM turn (stream start → final message): fed
+        # into the audit log below — the old stub logged 0.0 forever, so
+        # slow-provider turns were invisible in the audit trail.
+        llm_turn_started = time.monotonic()
         usage = UsageSnapshot()
 
         # Provider-safe history at request time: mid-turn rollbacks
@@ -878,7 +882,7 @@ async def run_query(
 
         messages.append(final_message)
         # --- cost tracking + audit (#28/#29) + auto-checkpoint (#37) ---
-        _record_llm_usage(context, usage)
+        _record_llm_usage(context, usage, duration_seconds=time.monotonic() - llm_turn_started)
         cost_alert = _record_cost_and_alert(context, usage)
         if cost_alert is not None:
             yield StatusEvent(message=cost_alert.message), None
@@ -992,7 +996,9 @@ async def run_query(
     raise RuntimeError("Query loop exited without a max_turns limit or final response")
 
 
-def _record_llm_usage(context: QueryContext, usage: UsageSnapshot) -> None:
+def _record_llm_usage(
+    context: QueryContext, usage: UsageSnapshot, *, duration_seconds: float = 0.0
+) -> None:
     """Audit-log one completed LLM turn (#29). Never raises."""
     try:
         from openharness.services.audit_log import get_audit_log
@@ -1002,7 +1008,7 @@ def _record_llm_usage(context: QueryContext, usage: UsageSnapshot) -> None:
             input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
             output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
             cache_read_tokens=int(getattr(usage, "cache_read_tokens", 0) or 0),
-            duration_seconds=0.0,
+            duration_seconds=max(0.0, float(duration_seconds)),
         )
     except Exception:
         pass
@@ -1196,6 +1202,9 @@ async def _execute_tool_call(
             tool_exec_metadata_inner = dict(context.tool_metadata or {})
             tool_exec_metadata_inner.setdefault("tool_registry", context.tool_registry)
             tool_exec_metadata_inner.setdefault("ask_user_prompt", context.ask_user_prompt)
+            tool_exec_metadata_inner.setdefault(
+                "session_cost_tracker", getattr(context, "session_cost_tracker", None)
+            )
             inner_result = await _guarded_tool_execute(
                 context,
                 tool,
@@ -1273,6 +1282,10 @@ async def _execute_tool_call(
     tool_exec_metadata = dict(context.tool_metadata or {})
     tool_exec_metadata.setdefault("tool_registry", context.tool_registry)
     tool_exec_metadata.setdefault("ask_user_prompt", context.ask_user_prompt)
+    # The REAL tracked spend (#28) — cost_governor's status/check reads
+    # this so the model sees actual session cost, not just its own
+    # manual records (G9).
+    tool_exec_metadata.setdefault("session_cost_tracker", getattr(context, "session_cost_tracker", None))
     result = await _guarded_tool_execute(
         context,
         tool,
@@ -1299,8 +1312,10 @@ async def _execute_tool_call(
         is_error=result.is_error,
         result_metadata=dict(result.metadata or {}),
     )
-    # Optimization #7: invalidate cache on mutating tools (successful or not).
-    if tool_cache is not None and tool_cache.is_mutating(tool_name):
+    # Optimization #7: invalidate cache on mutating tools (successful or
+    # not). bash is judged PER COMMAND now — ``ls``/``git status`` between
+    # two edits no longer wipe every cached read.
+    if tool_cache is not None and tool_cache.is_mutating(tool_name, tool_input):
         tool_cache.invalidate_all()
     _record_tool_carryover(
         context,

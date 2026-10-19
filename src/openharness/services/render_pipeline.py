@@ -23,6 +23,13 @@ A real, queue-based scene renderer:
 - Pipeline overlap (#21): ``submit()`` never blocks, so LLM scene
   generation and rendering proceed concurrently.
 - Per-job timeout (#27 render stage) and queue monitoring (#40).
+- Kill integration (#26): the pipeline installs itself as a control-bus
+  watchee — ``trip()`` terminates live render subprocesses instead of
+  letting them run to their own timeouts — and finishes feed the bus,
+  so a healthy long render never looks like a hung session to the
+  watchdog.
+- Wait scoping (``wait_for_scenes``): wait for THIS call's scenes only
+  (dependency waves included), never for foreign background batches.
 
 Engine commands are templates (defaults for hyperframes/manim/blender/
 ffmpeg) overridable per project via ``render_engines.json`` in the
@@ -483,6 +490,7 @@ class RenderJob:
     finished_at: float | None = None
     worker: int | None = None
     cached: bool = False
+    aborted: bool = False
     command: list[str] = field(default_factory=list)
     timeout_seconds: float | None = None
     quality_score: float | None = None
@@ -497,6 +505,7 @@ class RenderJob:
             "status": self.status,
             "output_path": str(self.output_path) if self.output_path else None,
             "cached": self.cached,
+            "aborted": self.aborted,
             "duration_seconds": round(self.duration_seconds, 2),
             "error": self.error[:300],
             "worker": self.worker,
@@ -540,6 +549,9 @@ class RenderPipeline:
         self.cache = RenderCache() if cache_enabled else None
         self.nvenc = NVENCDetector()
         self._templates = load_engine_templates(cwd)
+        # mtime of render_engines.json at load time — the live re-bind
+        # trigger in get_render_pipeline() (see G4).
+        self._templates_stamp = _engine_templates_stamp(cwd)
         self._worker_tasks: list[asyncio.Task[None]] = []
         self._jobs: dict[str, RenderJob] = {}
         self._job_seq = 0
@@ -560,6 +572,79 @@ class RenderPipeline:
         self.progress_hook = progress_hook
         self.total_render_seconds = 0.0
         self.completed_renders = 0
+        # Live render subprocesses by job id — the abort surface for the
+        # control-bus watchee (#26). Registered on spawn, removed on exit.
+        self._live_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        # Best-effort: tell the control bus how to abort our subprocesses.
+        self._install_kill_watchee()
+
+    def _install_kill_watchee(self) -> None:
+        """Register ``abort_all`` with the shared control bus (best-effort).
+
+        The active bus is the process-wide singleton (the engine installs
+        its configured bus there via ``set_control_bus``), so re-registering
+        here after any bus swap is safe — registration is idempotent.
+        """
+        try:
+            from openharness.services.control_bus import get_control_bus
+
+            get_control_bus().install_watchee("render_pipeline", self.abort_all)
+        except Exception:  # noqa: BLE001 - control integration is optional
+            log.debug("render pipeline: control-bus watchee not installed", exc_info=True)
+
+    async def abort_all(self, reason: str = "killed") -> int:
+        """Terminate every live render subprocess (#26 watchee).
+
+        Jobs are marked ``failed``/``aborted`` FIRST (so waiters and
+        summaries see the abort instantly — racing the worker's own
+        SIGTERM handling, which would otherwise record a generic
+        exit-code failure first), then the OS processes are terminated
+        (SIGTERM, 5s grace, SIGKILL). Returns the number of jobs aborted.
+        """
+        processes = list(self._live_processes.items())
+        aborted = 0
+        # 1. Mark first: status is terminal from this instant, and the
+        #    ``aborted`` flag stops the worker from overwriting it with
+        #    "done" if the engine exits 0 on SIGTERM.
+        for job_id, _process in processes:
+            job = self._jobs.get(job_id)
+            if job is not None and job.status in {"pending", "running"}:
+                job.status = "failed"
+                job.error = f"aborted: {reason}"
+                job.aborted = True
+                job.finished_at = time.monotonic()
+                self._finish(job)
+                aborted += 1
+            self._live_processes.pop(job_id, None)
+        # 2. Terminate the OS processes.
+        for _job_id, process in processes:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass  # already dead
+            except Exception:  # noqa: BLE001 - abort must keep going
+                pass
+        if processes:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(p.wait() for _jid, p in processes if p.returncode is None),
+                        return_exceptions=True,
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                for _job_id, process in processes:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        pass
+        if aborted:
+            log.warning("render pipeline aborted %d live job(s): %s", aborted, reason)
+        return aborted
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -574,6 +659,33 @@ class RenderPipeline:
             self._worker_tasks.append(
                 asyncio.create_task(self._worker_loop(worker_id), name=f"render-worker-{worker_id}")
             )
+        # Watchdog heartbeat (#36): running renders ARE observable
+        # progress. Without this, one long Blender/ManimGX job with no
+        # tool activity in between tripped the 900s watchdog and killed
+        # healthy sessions mid-render.
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name="render-heartbeat"
+        )
+
+    async def _heartbeat_loop(self) -> None:
+        """Feed the control bus every 60s while renders are in flight."""
+        try:
+            from openharness.services.control_bus import get_control_bus
+        except Exception:  # noqa: BLE001 - optional integration
+            return
+        while True:
+            await asyncio.sleep(60.0)
+            if self._has_inflight_jobs():
+                try:
+                    get_control_bus().feed("render-heartbeat")
+                except Exception:  # noqa: BLE001 - never crash the heart
+                    pass
+
+    def _has_inflight_jobs(self) -> bool:
+        return (
+            self._pending_submissions > 0
+            or any(j.status in {"pending", "running"} for j in self._jobs.values())
+        )
 
     async def shutdown(self, *, drain: bool = True) -> None:
         """Stop accepting jobs; optionally drain queued ones first (#32)."""
@@ -594,6 +706,13 @@ class RenderPipeline:
             except (asyncio.CancelledError, Exception):
                 pass
         self._worker_tasks = []
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._heartbeat_task = None
         self._started = False
         self._closing = False
 
@@ -738,6 +857,95 @@ class RenderPipeline:
                 break
             await asyncio.sleep(0.2)
         return list(self._jobs.values())
+
+    # ------------------------------------------------------------------
+    # Scoped waiting (#25 — dependency waves, G1 fix)
+    # ------------------------------------------------------------------
+
+    def jobs_for_scenes(
+        self,
+        scenes: list[Path],
+        *,
+        tier: str | None = None,
+        since: float | None = None,
+    ) -> dict[str, RenderJob]:
+        """Latest job per scene — ALL dependency waves included.
+
+        ``since`` (a ``time.monotonic()`` value) restricts the match to
+        jobs enqueued at/after that instant, so an older background
+        batch rendering the same scenes is never confused with this
+        call's jobs. Scenes without a matching job are simply absent
+        from the result.
+        """
+        wanted: dict[Path, str] = {}
+        for scene in scenes:
+            try:
+                resolved = Path(scene).resolve()
+            except OSError:
+                resolved = Path(scene)
+            wanted[resolved] = Path(scene).stem
+        result: dict[str, RenderJob] = {}
+        for job in self._jobs.values():
+            if tier is not None and job.tier != tier:
+                continue
+            if since is not None and job.enqueued_at < since:
+                continue
+            try:
+                resolved = Path(job.scene).resolve()
+            except OSError:
+                resolved = Path(job.scene)
+            stem = wanted.get(resolved)
+            if stem is None and not job.scene.exists() and job.scene.stem in set(wanted.values()):
+                # moved/removed file: basename fallback (see _jobs_for_scene)
+                stem = job.scene.stem
+            if stem is None:
+                continue
+            current = result.get(stem)
+            if current is None or job.enqueued_at >= current.enqueued_at:
+                result[stem] = job
+        return result
+
+    async def wait_for_scenes(
+        self,
+        scenes: list[Path],
+        *,
+        tier: str | None = None,
+        since: float | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, RenderJob]:
+        """Wait until every scene has a TERMINAL job — waves included.
+
+        Unlike ``wait_all`` this is scoped to THIS call's scenes: foreign
+        background batches submitted earlier never delay the return. The
+        loop also exits when the machine is fully drained but some scene
+        still has no job (dependency chain aborted) so a dead chain cannot
+        hold the caller until the timeout — the summary then reports the
+        missing scenes as never-submitted.
+        """
+        deadline = time.monotonic() + (
+            timeout or self.render_timeout_seconds * max(1, len(scenes))
+        )
+        drained_polls = 0
+        while time.monotonic() <= deadline:
+            by_scene = self.jobs_for_scenes(scenes, tier=tier, since=since)
+            terminal = {
+                stem: job
+                for stem, job in by_scene.items()
+                if job.status not in {"pending", "running"}
+            }
+            if len(terminal) == len(scenes):
+                return terminal
+            # Drained = nothing pending/running anywhere, no promised
+            # submissions, and two consecutive polls agreed — any scene
+            # still without a job will NEVER get one (chain aborted).
+            if not self._has_inflight_jobs():
+                drained_polls += 1
+                if drained_polls >= 2:
+                    return terminal
+            else:
+                drained_polls = 0
+            await asyncio.sleep(0.2)
+        return self.jobs_for_scenes(scenes, tier=tier, since=since)
 
     # ------------------------------------------------------------------
     # Draft-first + early exit (#12, #13, #16)
@@ -958,7 +1166,7 @@ class RenderPipeline:
             )
             self._finish(job)
             return
-
+        self._live_processes[job.job_id] = process
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=job.timeout_seconds)
         except asyncio.TimeoutError:
@@ -971,6 +1179,13 @@ class RenderPipeline:
             job.error = f"render exceeded {job.timeout_seconds:.0f}s and was killed"
             job.exit_code = process.returncode
             self._finish(job)
+            return
+        finally:
+            self._live_processes.pop(job.job_id, None)
+        if job.aborted:
+            # abort_all already recorded the outcome; never overwrite
+            # the abort verdict (an engine exiting 0 on SIGTERM must not
+            # resurrect itself as "done").
             return
 
         job.finished_at = time.monotonic()
@@ -1035,6 +1250,15 @@ class RenderPipeline:
         if job.finished_at is None:
             job.finished_at = time.monotonic()
         self._audit(f"render_{job.status}", job)
+        # A finished job is observable progress for the watchdog (#36):
+        # without this feed, back-to-back long renders with no tool call
+        # in between tripped the no-progress kill switch mid-session.
+        try:
+            from openharness.services.control_bus import get_control_bus
+
+            get_control_bus().feed(f"render:{job.status}")
+        except Exception:  # noqa: BLE001 - progress feed is best-effort
+            pass
 
     def _audit(self, event: str, job: RenderJob) -> None:
         if self.audit_hook is not None:
@@ -1052,17 +1276,26 @@ class RenderPipeline:
 
 
 def _visible_gpu_count() -> int:
-    """Cached count of usable GPUs (0 on CPU-only hosts)."""
-    global _GPU_COUNT_CACHE
-    if _GPU_COUNT_CACHE is None:
-        try:
-            from openharness.services.kaggle_env import detect_kaggle_resources
+    """Count of usable GPUs (0 on CPU-only hosts), re-probed at most
+    once per minute.
 
-            count = int(detect_kaggle_resources().get("gpu_count", 0) or 0)
-        except Exception:
-            count = 0
-        _GPU_COUNT_CACHE = max(0, count)
-    return _GPU_COUNT_CACHE
+    The old process-lifetime cache meant a GPU attached mid-session
+    (or a Kaggle accelerator toggle) stayed invisible until restart.
+    A 60s TTL bounds the nvidia-smi cost on the submit hot path while
+    still picking up hardware changes within a minute.
+    """
+    global _GPU_COUNT_CACHE
+    now = time.monotonic()
+    if _GPU_COUNT_CACHE is not None and (now - _GPU_COUNT_CACHE[1]) < 60.0:
+        return _GPU_COUNT_CACHE[0]
+    try:
+        from openharness.services.kaggle_env import detect_kaggle_resources
+
+        count = int(detect_kaggle_resources().get("gpu_count", 0) or 0)
+    except Exception:
+        count = 0
+    _GPU_COUNT_CACHE = (max(0, count), now)
+    return _GPU_COUNT_CACHE[0]
 
 
 def _worker_env(worker_id: int, worker_count: int) -> dict[str, str]:
@@ -1090,7 +1323,7 @@ def _worker_env(worker_id: int, worker_count: int) -> dict[str, str]:
 # ======================================================================
 
 _PIPELINE: RenderPipeline | None = None
-_GPU_COUNT_CACHE: int | None = None
+_GPU_COUNT_CACHE: tuple[int, float] | None = None
 
 
 def recommended_worker_count(*, gpu_count: int | None = None) -> int:
@@ -1110,7 +1343,10 @@ def get_render_pipeline(cwd: Path | None = None, settings: Any = None) -> Render
 
     Settings are only consumed on first creation; the singleton then
     persists for the process so tools and auto-enqueue hooks share one
-    queue and one cache.
+    queue and one cache. Engine templates are the one thing re-bound
+    live: editing ``render_engines.json`` takes effect on the next tool
+    call WITHOUT a restart (a mid-session template edit used to be
+    silently ignored until the process died).
     """
     global _PIPELINE
     if _PIPELINE is None:
@@ -1130,7 +1366,29 @@ def get_render_pipeline(cwd: Path | None = None, settings: Any = None) -> Render
             render_timeout_seconds=int(getattr(rendering, "render_timeout_seconds", 1800) or 1800),
             stealing=bool(getattr(rendering, "work_stealing", True)),
         )
+    else:
+        # Re-bind engine templates when render_engines.json changed on disk
+        # (same-cwd only — a different cwd means a different project).
+        effective_cwd = Path(cwd) if cwd else _PIPELINE.cwd
+        if effective_cwd == _PIPELINE.cwd:
+            try:
+                stamp = _engine_templates_stamp(_PIPELINE.cwd)
+                if stamp is not None and stamp != _PIPELINE._templates_stamp:
+                    _PIPELINE._templates = load_engine_templates(_PIPELINE.cwd)
+                    _PIPELINE._templates_stamp = stamp
+                    log.info("render_engines.json changed on disk; templates re-bound")
+            except Exception:  # noqa: BLE001 - never break tool calls
+                log.debug("engine template re-bind check failed", exc_info=True)
     return _PIPELINE
+
+
+def _engine_templates_stamp(cwd: Path) -> float | None:
+    """mtime of the project's render_engines.json (None when absent)."""
+    try:
+        path = cwd / "render_engines.json"
+        return path.stat().st_mtime if path.is_file() else None
+    except OSError:
+        return None
 
 
 def reset_render_pipeline() -> None:

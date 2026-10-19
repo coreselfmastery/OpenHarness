@@ -78,6 +78,34 @@ export OPENHARNESS_AUTO_SAVE=1
 export OPENHARNESS_AUTO_SAVE_INTERVAL=10
 ```
 
+### Video QA + render pipeline (Kaggle-specific)
+
+```bash
+# --- QA funnel (items #7-#10) ------------------------------------------
+# Parallel review waves. 0 = one scene at a time (debug only — slow).
+export OPENHARNESS_QA_PARALLEL=1
+# Scenes reviewed per wave. 5 is a good default on Kaggle; larger waves
+# hit the LLM harder per call but finish the funnel in fewer rounds.
+export OPENHARNESS_QA_WAVE_SIZE=5
+# Batch several scenes into ONE QA LLM call (~10x fewer calls).
+export OPENHARNESS_QA_BATCHING=1
+# Dedicated QA model (defaults to the scene-gen model when empty).
+export OPENHARNESS_QA_MODEL=
+export OPENHARNESS_QA_API_KEY=
+export OPENHARNESS_QA_BASE_URL=
+
+# --- Render pipeline (items #11-#17) ------------------------------------
+# Per-render-job hard timeout. Default 7200s: a Blender hero shot on a
+# T4 (128spp, ~10-40 s/frame) legitimately runs 1-2h. Raise it for
+# longer hero sequences; the engines' own per-frame caps still bound
+# stuck frames.
+export OPENHARNESS_RENDER_TIMEOUT_SECONDS=7200
+# Kill switch watchdog: no observable progress for this many seconds
+# trips the kill. Auto-raised to >= 1.5x the tool timeout; running
+# renders also feed the watchdog (a healthy long render is progress).
+export OPENHARNESS_WATCHDOG_TIMEOUT_SECONDS=1350
+```
+
 ### Trusted paths whitelist (optional)
 
 ```bash

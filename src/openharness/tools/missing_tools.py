@@ -152,31 +152,84 @@ class CostGovernorTool(BaseTool):
 
     async def execute(self, arguments: CostGovernorToolInput, context: ToolExecutionContext) -> ToolResult:
         gov = self.get_governor()
+        # The REAL session spend (#28) from the wired SessionCostTracker —
+        # the governor's own numbers are only the model's manual records
+        # (advisory before). Fold both so 'check'/'status' reflect reality.
+        tracker = (context.metadata or {}).get("session_cost_tracker")
+        real_spent = float(getattr(tracker, "spent_usd", 0.0) or 0.0)
+        real_calls = int(getattr(tracker, "calls", 0) or 0)
+        tracker_budget = getattr(tracker, "budget_usd", None)
+        tracker_halted = bool(
+            tracker_budget is not None
+            and float(tracker_budget) > 0
+            and real_spent >= float(tracker_budget)
+        )
+        effective_spent = max(gov.spent, real_spent)
+        effective_budget = max(gov.budget, float(tracker_budget or 0.0))
+
+        def merged_stats() -> dict[str, Any]:
+            stats = gov.stats()
+            stats.update(
+                {
+                    "session_spent_usd": round(real_spent, 4),
+                    "session_llm_calls": real_calls,
+                    "session_budget_usd": tracker_budget,
+                    "session_budget_halted": tracker_halted,
+                    "effective_spent_usd": round(effective_spent, 4),
+                    "effective_budget_usd": effective_budget,
+                }
+            )
+            return stats
+
         if arguments.action == "check":
-            if gov.should_stop():
+            exceeded = gov.should_stop() or tracker_halted or (
+                effective_budget > 0 and effective_spent >= effective_budget
+            )
+            if exceeded:
                 return ToolResult(
-                    output=f"BUDGET EXCEEDED: ${gov.spent:.2f} / ${gov.budget:.2f}. Halting.",
+                    output=(
+                        f"BUDGET EXCEEDED: ${effective_spent:.2f} / ${effective_budget:.2f}. "
+                        "Halting. (manual + session-tracked spend)"
+                    ),
                     is_error=True,
-                    metadata=gov.stats(),
+                    metadata=merged_stats(),
                 )
             return ToolResult(
-                output=f"Budget OK: ${gov.spent:.2f} / ${gov.budget:.2f} (${gov.remaining:.2f} remaining)",
-                metadata=gov.stats(),
+                output=(
+                    f"Budget OK: ${effective_spent:.2f} / ${effective_budget:.2f} "
+                    f"(manual ${gov.spent:.2f} + session-tracked ${real_spent:.2f})"
+                ),
+                metadata=merged_stats(),
             )
         elif arguments.action == "record":
             gov.record_spend(arguments.cost_usd, call_type=arguments.call_type)
-            halted = gov.should_stop()
-            msg = f"Recorded ${arguments.cost_usd:.4f} ({arguments.call_type}). Total: ${gov.spent:.2f} / ${gov.budget:.2f}"
+            halted = gov.should_stop() or tracker_halted
+            msg = (
+                f"Recorded ${arguments.cost_usd:.4f} ({arguments.call_type}). "
+                f"Manual total: ${gov.spent:.2f} / ${gov.budget:.2f}; "
+                f"session-tracked: ${real_spent:.2f}"
+            )
             if halted:
                 msg += " — BUDGET EXCEEDED"
-            return ToolResult(output=msg, is_error=halted, metadata=gov.stats())
+            return ToolResult(output=msg, is_error=halted, metadata=merged_stats())
         elif arguments.action == "status":
-            return ToolResult(output=f"Spent ${gov.spent:.2f} / ${gov.budget:.2f}", metadata=gov.stats())
+            return ToolResult(
+                output=(
+                    f"Manual spend ${gov.spent:.2f} / ${gov.budget:.2f}; "
+                    f"session-tracked spend ${real_spent:.2f} over {real_calls} LLM call(s)"
+                    + (
+                        f" (session budget ${float(tracker_budget):.2f})"
+                        if tracker_budget
+                        else " (no session budget set)"
+                    )
+                ),
+                metadata=merged_stats(),
+            )
         elif arguments.action == "reset":
             budget = arguments.budget_usd if arguments.budget_usd > 0 else gov.budget
             gov.reset()
             gov._budget = budget
-            return ToolResult(output=f"Budget reset to ${budget:.2f}", metadata=gov.stats())
+            return ToolResult(output=f"Budget reset to ${budget:.2f}", metadata=merged_stats())
         else:
             return ToolResult(output=f"Unknown action: {arguments.action}", is_error=True)
 

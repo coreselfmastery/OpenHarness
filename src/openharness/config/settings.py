@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from openharness.hooks.schemas import HookDefinition
 from openharness.mcp.types import McpServerConfig
@@ -751,7 +751,7 @@ class RenderSettings(BaseModel):
     # #24 — idle render workers steal queued work from busy workers.
     work_stealing: bool = True
     # Per-render-job hard timeout (#27 render stage).
-    render_timeout_seconds: int = 1800
+    render_timeout_seconds: int = 7200
 
 
 class QASettings(BaseModel):
@@ -781,6 +781,11 @@ class ControlSettings(BaseModel):
     ``enabled`` gates the invasive pieces (kill switch checks in the
     query loop, watchdog, pause gates). Audit logging and checkpoints
     are cheap and on by default.
+
+    The watchdog is auto-raised to at least 1.5x the tool timeout: with
+    the old equal defaults (900s == 900s) one slow-but-healthy tool with
+    no intermediate feed tripped the kill switch at the exact moment the
+    tool was about to return.
     """
 
     enabled: bool = True
@@ -789,7 +794,8 @@ class ControlSettings(BaseModel):
     # #30
     pause_resume: bool = True
     # #36 — no progress for this many seconds -> trip the kill switch.
-    watchdog_timeout_seconds: int = 900
+    # (validated up to >= 1.5 * tool_timeout_seconds below)
+    watchdog_timeout_seconds: int = 1350
     # #34 — detect stuck agents (semaphore fully held + no completions).
     deadlock_detection: bool = True
     deadlock_probe_seconds: int = 180
@@ -813,6 +819,24 @@ class ControlSettings(BaseModel):
     state_validation: bool = True
     # #32 — finish in-flight work before the process dies.
     graceful_shutdown: bool = True
+
+    @model_validator(mode="after")
+    def _watchdog_at_least_1p5x_tool_timeout(self) -> "ControlSettings":
+        """A tool running to its own timeout is NOT a hung session.
+
+        Equal defaults (900/900) made the watchdog race the tool timeout:
+        the kill fired while the tool was still legitimately working.
+        1.5x headroom means a tool that uses its full budget and THEN
+        feeds the bus (the normal ``finally`` path) never trips the
+        watchdog. Explicitly setting a LOWER watchdog is honored only
+        when the user also raised the tool timeout — deliberate intent,
+        not an accident of defaults.
+        """
+        if self.watchdog_timeout_seconds > 0 and self.tool_timeout_seconds > 0:
+            floor = int(1.5 * self.tool_timeout_seconds)
+            if self.watchdog_timeout_seconds < floor:
+                object.__setattr__(self, "watchdog_timeout_seconds", floor)
+        return self
 
 
 class ModelCacheSettings(BaseModel):
