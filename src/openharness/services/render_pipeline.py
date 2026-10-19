@@ -146,6 +146,12 @@ def build_render_command(
     ``{codec_args}``) expand into multiple argv entries via
     :func:`shlex.split`; placeholders embedded inside a larger token
     are substituted in place as before.
+
+    ``{tier}`` substitutes the tier name itself (draft/review/final) — the
+    hook ``render_engines.json`` uses to route OpenHarness tiers onto
+    engine toolchains (e.g. OpenVideoHarness's Cycles profiles turbo/
+    draft/final; see docs/VIDEO_HARNESS.md "The RenderQueue onto the
+    OpenVideoHarness toolchain").
     """
     templates = templates or DEFAULT_ENGINE_TEMPLATES
     template = templates.get(engine) or templates["hyperframes"]
@@ -156,6 +162,7 @@ def build_render_command(
         "width": str(width),
         "height": str(height),
         "fps": str(fps),
+        "tier": tier,
         "codec_args": codec_args,
         "quality": _MANIM_QUALITY.get(tier, "m"),
         "scene_class": extract_scene_class(scene_path),

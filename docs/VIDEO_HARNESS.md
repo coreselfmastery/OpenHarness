@@ -136,6 +136,48 @@ whole run                     ──►  progress / checkpoint / cost_report
 10. **Ship** — `progress` shows the board; `cost_report` shows the
    damage; `checkpoint` protects the long run.
 
+## The RenderQueue onto the OpenVideoHarness toolchain
+
+`render_scenes` renders through **engine command templates**
+(`DEFAULT_ENGINE_TEMPLATES` in `render_pipeline.py`) — plain argv
+lists, overridable per project via `render_engines.json` in the
+project root. Placeholders now include `{tier}` (the tier name
+itself: draft/review/final) alongside `{scene}`/`{output}`/
+`{output_stem}`/`{width}`/`{height}`/`{fps}`/`{codec_args}`/
+`{quality}`/`{scene_class}`/`{media_dir}`/`{input_args}` — the hook
+that routes this machine's tiers onto OpenVideoHarness's engine
+toolchains.
+
+For Blender scenes inside an OpenVideoHarness checkout, drop this
+`render_engines.json` into the project root (this is the documented
+form, engines/blender-perf.md "与 OpenHarness 的桥"):
+
+```json
+{
+  "blender": [
+    "tools/blender_run.sh", "--profile", "{tier}", "--",
+    "blender", "-b", "{scene}", "-o", "{output_stem}", "-a"
+  ]
+}
+```
+
+- `--profile {tier}` lands on OpenVideoHarness's Cycles profiles:
+  draft→draft, review→draft (the `review` alias), final→final —
+  OIDN, the bounce budget and the determinism contract ride along.
+- No `--gpu` needed: each RenderQueue worker already pins its
+  subprocess with `CUDA_VISIBLE_DEVICES`, so each Blender process
+  sees exactly one card — the one-card-per-frame contract.
+- Long single sequences that want BOTH cards at once do not go
+  through the queue: OpenVideoHarness's `tools/blender_split.sh`
+  splits the frame range across the GPUs (one process per card).
+- Web films (HyperFrames) are film-level renders with their own
+  gates (`bin/vh`); the queue's `hyperframes` template covers
+  per-scene render jobs only.
+- While renders run, `tools/kaggle/monitor.sh --watch 5` (from the
+  OpenVideoHarness side) shows both T4s, who holds each card, CPU,
+  RAM and the `/kaggle/working` disk — the "no wasted machine"
+  glance.
+
 ## MiniCPM-V 4.5: local vision that fits on one GPU
 
 MiniCPM-V 4.5 is an 8B-parameter multimodal model; **4-bit quantized

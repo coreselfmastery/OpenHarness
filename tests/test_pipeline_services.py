@@ -985,6 +985,29 @@ def test_build_render_command_substitutes_everything(tmp_path: Path):
     assert "Opener" in custom_joined
     assert "{codec_args}" not in custom_joined and "{input_args}" not in custom_joined
 
+    # {tier} substitutes the tier name itself — the hook render_engines.json
+    # uses to route OpenHarness tiers onto engine toolchains (OpenVideoHarness
+    # Cycles profiles: draft→draft, review→draft alias, final→final).
+    tiered = build_render_command(
+        engine="blender-tools",
+        scene_path=scene,
+        output_path=output,
+        tier="final",
+        width=1920,
+        height=1080,
+        fps=30,
+        codec_args="",
+        output_dir=tmp_path / "renders",
+        templates={
+            "blender-tools": [
+                "tools/blender_run.sh", "--profile", "{tier}", "--",
+                "blender", "-b", "{scene}", "-o", "{output_stem}", "-a",
+            ]
+        },
+    )
+    assert "--profile final" in " ".join(tiered)
+    assert "{tier}" not in " ".join(tiered)
+
 
 # ======================================================================
 # 8. Server acceleration reporting (#41-#50)
