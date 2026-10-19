@@ -731,7 +731,7 @@ class RenderSettings(BaseModel):
     # full-quality version for approved scenes.
     draft_first: bool = True
     resolution_tiers: dict[str, str] = Field(
-        default_factory=lambda: {"draft": "640x360", "review": "1280x720", "final": "1920x1080"}
+        default_factory=lambda: {"draft": "640x360", "review": "1280x720", "final": "1920x1080", "beast": "1280x720"}
     )
     # #13 — promote a passing draft (skip the full render) when its
     # quality gate score clears this threshold (0.0-1.0).

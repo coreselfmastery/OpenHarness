@@ -54,8 +54,14 @@ from openharness.services.render_cache import RenderCache, scene_fingerprint
 
 log = logging.getLogger(__name__)
 
-TIERS = ("draft", "review", "final")
+TIERS = ("draft", "review", "final", "beast")
 TIER_ORDER = {name: index for index, name in enumerate(TIERS)}
+# "beast" is THE one tier (OpenVideoHarness playbook/01-pipeline.md): the film
+# rendered ONCE at ship grade — 720p-class, NVENC p5/cq21 when a card answers —
+# instead of walking the draft→review→final ladder. It sorts above final so
+# tier comparisons treat it as the top of the ladder, but it is meant to be
+# used alone: submit(tier="beast") and the {tier} placeholder routes it onto
+# every engine's own beast policy (render.mjs --tier beast, blender --profile beast).
 
 
 # ======================================================================
@@ -88,13 +94,14 @@ DEFAULT_ENGINE_TEMPLATES: dict[str, list[str]] = {
 }
 
 # manim quality flag per tier.
-_MANIM_QUALITY = {"draft": "l", "review": "m", "final": "h"}
+_MANIM_QUALITY = {"draft": "l", "review": "m", "final": "h", "beast": "m"}
 
 #: ffmpeg input args per tier — a black canvas the filter script draws on.
 _FFMPEG_INPUT_ARGS = {
     "draft": "-f lavfi -i color=c=black:s=640x360:d=10:r=30",
     "review": "-f lavfi -i color=c=black:s=1280x720:d=10:r=30",
     "final": "-f lavfi -i color=c=black:s=1920x1080:d=10:r=30",
+    "beast": "-f lavfi -i color=c=black:s=1280x720:d=10:r=30",
 }
 
 _NVENC_ARGS = "-c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -b:v 0 -pix_fmt yuv420p"
