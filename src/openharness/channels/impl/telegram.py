@@ -404,11 +404,17 @@ class TelegramChannel(BaseChannel):
 
                 media_paths.append(str(file_path))
 
-                # Handle voice transcription
-                if media_type == "voice" or media_type == "audio":
-                    from openharness.providers.transcription import GroqTranscriptionProvider  # noqa: F401
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
+                # Handle voice transcription. A transcription failure (no key,
+                # upstream error) must not lose the media that did download:
+                # the file path stays in the message either way.
+                if media_type in ("voice", "audio"):
+                    transcription = ""
+                    try:
+                        from openharness.providers.transcription import GroqTranscriptionProvider
+                        transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+                        transcription = await transcriber.transcribe(file_path)
+                    except Exception as exc:
+                        logger.warning("Voice transcription failed for %s: %s", file_path, exc)
                     if transcription:
                         logger.info("Transcribed %s: %s...", media_type, transcription[:50])
                         content_parts.append(f"[transcription: {transcription}]")

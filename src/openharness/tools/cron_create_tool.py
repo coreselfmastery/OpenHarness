@@ -28,7 +28,7 @@ class CronCreateToolInput(BaseModel):
     payload: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Optional nanobot-style payload. Example: "
+            "Optional structured payload. Example: "
             "{'kind': 'agent_turn', 'message': 'check GitHub', 'deliver': True, 'channel': 'feishu', 'to': 'ou_xxx'}."
         ),
     )

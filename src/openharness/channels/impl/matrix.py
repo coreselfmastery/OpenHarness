@@ -32,12 +32,12 @@ try:
     from nio.exceptions import EncryptionError
 except ImportError as e:
     raise ImportError(
-        "Matrix dependencies not installed. Run: pip install nanobot-ai[matrix]"
+        "Matrix dependencies not installed. Run: pip install openharness-ai[matrix]"
     ) from e
 
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.impl.base import BaseChannel
-from openharness.config.loader import get_data_dir
+from openharness.config.paths import get_data_dir
 from openharness.utils.helpers import safe_filename
 
 logger = logging.getLogger(__name__)
